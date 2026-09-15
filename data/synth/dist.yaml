@@ -1,0 +1,10 @@
+# Real-world distributions used by the synthetic generators.
+# source: default | survey | pairs   (tools/pair_stats.py and tools/photo_survey.py overwrite this)
+source: default
+n_colors: {min: 2, max: 12}
+width_cm: {min: 60, max: 300}
+height_cm: {min: 90, max: 400}
+reed_per_m: {min: 300, max: 500}
+wefts_per_m: {min: 300, max: 500}
+photo_px_per_knot: {p10: 1.2, p50: 1.9, p90: 3.5}
+machine_colors: [5, 6, 8, 12]

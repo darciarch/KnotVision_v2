@@ -1,0 +1,9 @@
+# config/agents/qwen2511_direct.yaml  -- single pass, no loop; the cheapest edit baseline
+backend: qwen_edit_2511
+edit_n_candidates: 1
+edit_max_rounds: 1
+select_weights: {edge_iou: 1.0, added_pct: -2.0, missing_pct: -2.0, align_px: -1.0, palette_deltaE_p95: -0.5, noise_1knot_pct: -0.5, line_jaggedness: -0.3}
+num_inference_steps: 30
+true_cfg_scale: 4.0
+lightning_lora: false
+edit_lora: null                 # optional path under models/edit_lora/

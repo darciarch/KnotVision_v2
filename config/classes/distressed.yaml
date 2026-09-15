@@ -1,0 +1,9 @@
+# config/classes/distressed.yaml
+design_mode: quantize
+regularize: off
+min_region_knots: 1           # remove single-knot islands only; set to 0 if noise_stats.py finds intentional 1-knot noise in the archive
+min_coverage_pct: 0.0
+force_symmetry: off
+force_border_repeat: off
+force_ground_repeat: off
+qc_features_null: [noise_knots_pct, cleanup_changed_pct]

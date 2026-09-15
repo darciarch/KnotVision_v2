@@ -1,0 +1,16 @@
+[project]
+name = "knotvision"
+version = "6.6.0"
+description = "Customer carpet photo -> indexed Wilton production design (Texcelle-compatible)."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a GPU and model weights",
+    "slow: long-running",
+]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["knotvision*"]

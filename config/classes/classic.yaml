@@ -1,0 +1,4 @@
+# config/classes/classic.yaml
+# Intentionally empty: profile defaults apply. `design_mode: segment` is written here only after
+# segment meets the release criterion on this class (commit message must reference the eval CSV).
+{}

@@ -1,0 +1,11 @@
+# Default 4x4 Bayer ordered dither. Using this file (dither_pattern: null) raises the
+# dither_pattern_default hard gate on jobs that have a gradient mask; replace with
+# config/dither/archive.yaml produced by tools/dither_stats.py and confirmed by the designer.
+name: ordered4
+type: ordered            # ordered | row_scan | diagonal_scan
+levels: 4
+matrix:
+  - [0, 8, 2, 10]
+  - [12, 4, 14, 6]
+  - [3, 11, 1, 9]
+  - [15, 7, 13, 5]

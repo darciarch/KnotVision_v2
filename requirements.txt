@@ -1,0 +1,20 @@
+# Core (modelless chain). All Apache-2.0 / MIT / BSD.
+numpy
+opencv-contrib-python   # ximgproc (guided filter), ECC, TPS. Use opencv-contrib-python-headless on servers.
+pillow
+scikit-image
+scipy
+scikit-learn
+tifffile
+pyyaml
+noise                   # simplex noise for the procedural design generator
+requests                # muse_image API adapters
+pytest
+
+# Models (optional at runtime; setup-check reports what is missing)
+# torch, torchvision, timm                 # segment (SegNet, convnext_tiny)
+# diffusers, transformers, accelerate      # qwen_edit backends (QwenImageEditPlusPipeline)
+# peft                                     # optional edit LoRA
+# segmentation-models-pytorch              # optional fallback decoder
+# sam3   # pip install git+https://github.com/facebookresearch/sam3 ; weights in models/sam3.1/
+# NEVER: ultralytics (AGPL)

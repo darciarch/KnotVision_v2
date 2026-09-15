@@ -1,0 +1,3 @@
+# config/classes/geometric.yaml
+# Intentionally empty: profile defaults apply (force_symmetry: auto stays). See classic.yaml.
+{}

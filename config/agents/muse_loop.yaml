@@ -1,0 +1,6 @@
+# config/agents/muse_loop.yaml  -- API backend; nondeterministic; costs money and sends the photo out
+backend: muse_image
+edit_n_candidates: 2
+edit_max_rounds: 3
+select_weights: {edge_iou: 1.0, added_pct: -2.0, missing_pct: -2.0, align_px: -1.0, palette_deltaE_p95: -0.5, noise_1knot_pct: -0.5, line_jaggedness: -0.3}
+resolution: 2K

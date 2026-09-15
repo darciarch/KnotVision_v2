@@ -1,0 +1,79 @@
+# config/looms/wilton_default.yaml
+name: wilton_default
+allowed_machine_colors: [5, 6, 8, 12]
+reed_per_m: null              # warp ends per meter; loom constant. null -> square assumption + grid_unverified
+density_definition: knots_m2  # knots_m2 | wefts_per_m | reed_x_wefts
+allow_api: false              # true permits API backends (muse_image); customer photo leaves the machine
+muse_provider: meta           # meta | fal | runware | openrouter
+muse_price_usd: 0.01          # per generated image; used for cost_usd reporting only
+photo_long_px_rec: 3000       # recommended to customers; informational only, never a gate
+min_region_knots: 2           # components at or below this area are merged into a neighbor; 0 disables
+line_min_knots: 6
+line_max_width: 1
+motif_min_knots: 10           # overwritten by tools/motif_stats.py
+motif_min_knots_source: assumed
+motif_color_min_cc: 5
+noise_cc_min: 2               # noise_frac counts components with area in [noise_cc_min, noise_cc_max]
+noise_cc_max: 6               # overwritten by tools/noise_stats.py
+noise_scale_source: assumed
+min_coverage_pct: 0.5
+area_weight_exp: 0.5
+adjacency_penalty: 2.0        # palette; ignored inside the gradient mask
+gain_stop_select: 0.3         # library path: stop when weighted deltaE gain falls below this
+merge_cost_stop: 0.5          # no-library path: keep merging while merge cost stays below this (initial guess)
+guard_warn_pct: 0.02
+deltaE_warn: 3.0              # production: per-entry quantization_deltaE above this -> palette_far warning
+eval_deltaE_max: 3.0          # offline eval: knot_deltaE_mean ceiling vs truth; fixed after designer measurement
+palette_model_mismatch_warn: 12.0
+piece_rug: true
+allow_partial: false
+allow_low_res: false
+fringe_detect: true
+fringe_max_frac: 0.15
+planarity_warn: 0.02
+planarity_stop: 0.05
+border_frac_min: 0.03
+border_frac_max: 0.30
+illum_poly_deg: 2
+illum_warn: 15.0
+photo_px_warn: 1.5            # applied to photo_px_per_knot_eff; the only resolution gate
+photo_px_stop: 0.8
+pile_blur_knots: 2.0
+grid_mismatch_tol: 0.05
+edge_density_min: 0.02
+gradient_class_frac: 0.25
+noise_class_frac: 0.08
+class_margin_min: 0.2         # class_margin below this -> class_uncertain (auto mode) / no class_conflict (designer mode)
+design_mode: quantize         # segment | quantize | edit; class files switch to segment/edit only after eval
+edit_agent: null              # required when design_mode is edit; config/agents/<name>.yaml
+edit_seed: 0
+edit_px_per_knot_target: 2.0  # single-pass target; tiling kicks in below this when edit_tiling is auto
+edit_px_per_knot_min: 1.0     # below this -> edit_low_res hard gate
+edit_tiling: auto             # auto | off; auto tiles at edit_tile_px when single pass < target
+edit_tile_px: 1024
+edit_thin_line_max: 0.01      # thin_line_frac at or above this -> job is routed away from edit (edit_thin_lines)
+edit_max_wall_s: 900          # soft cap for the agent loop; exceeded -> edit_timeout (best candidate so far is used)
+edit_align_max: 6.0           # px at 4 px/knot (= 1.5 knots), p95 of block displacement; above -> edit_drift
+edit_added_max: 0.01          # added-component knot share vs quantize baseline; above -> edit_added hard gate
+edit_missing_max: 0.02        # missing-component knot share vs quantize baseline; above -> edit_missing hard gate
+edit_gate_source: assumed     # assumed | eval; set to eval by eval/run.py once correlation with cc_* passes
+edit_gate_corr_min: 0.6       # Spearman(edit_*_pct, cc_*) required before edit gates count as eval-sourced
+edit_gain_tol: 0.02           # selected candidate must reach baseline_edge_iou - this, else edit_no_gain
+edit_palette_deltaE_max: 8.0  # loop stop criterion; candidate colors must stay near the palette
+edit_added_motif_max: 0       # offline eval: allowed added motifs for edit mode; 0 until designer measurement says otherwise
+regularize: auto
+reg_tol_knots: 0.7
+reg_min_line_knots: 4
+reg_free_runs: true
+enforce_conf: 0.85
+force_symmetry: auto          # auto only enforces for classic/geometric
+force_border_repeat: auto
+force_ground_repeat: auto
+dither: auto                  # auto = on when a gradient mask exists
+dither_pattern: null          # null -> 4x4 ordered + dither_pattern_default warning
+dither_levels: 4
+boundary_thr: 0.5
+boundary_snap_r: 2
+qc_accept: 0.8                # placeholder until models/qc_calib.json exists
+qc_reject: 0.3
+retention_days: 30
