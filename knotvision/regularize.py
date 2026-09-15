@@ -159,37 +159,20 @@ def _free_run(orig: np.ndarray, tol: float) -> np.ndarray:
     return sm if dev <= tol else orig
 
 
-def _polyline_rms(contour: np.ndarray, idx: list, i: int, j: int) -> float:
-    """rms distance of contour[idx[i]:idx[j]] to the DP polyline through the vertices idx[i..j]."""
-    d2, n = 0.0, 0
-    for k in range(i, j):
-        pts = contour[idx[k]:idx[k + 1] + 1]
-        a, b = contour[idx[k]], contour[idx[k + 1]]
-        ab = b - a
-        L = float(np.hypot(*ab))
-        if L < 1e-9 or len(pts) == 0:
-            continue
-        rel = pts - a
-        d2 += float((((ab[0] * rel[:, 1] - ab[1] * rel[:, 0]) / L) ** 2).sum())
-        n += len(pts)
-    return float(np.sqrt(d2 / n)) if n else 0.0
-
-
-def _arc_run(contour: np.ndarray, idx: list, i: int, tol: float, min_pts: int = 8) -> tuple:
+def _arc_run(contour: np.ndarray, idx: list, i: int, tol: float, min_len: float = 8.0) -> tuple:
     """Longest run of DP vertices idx[i..j] (j >= i+3) whose contour points fit one circle with rms
-    residual <= tol, a sagitta > tol, and a residual at most half of the DP polyline's own residual
-    (a diamond or a stepped polygon is described by its lines: equal residuals -> line).
+    residual <= tol, arc length >= min_len knots, sagitta > tol and no single line within tol
+    (spec: equal residuals -> line; a diamond side or a stepped polygon is described by its lines).
     (j, centre, r) or (None,)*3."""
     best = (None, None, None)
     for j in range(i + 3, len(idx)):
         pts = contour[idx[i]:idx[j] + 1]
-        if len(pts) < min_pts:
+        if len(pts) < 4 or _length(pts) < min_len:
             continue
         c, r, res = _circle_fit(pts)
         chord = float(np.hypot(*(pts[-1] - pts[0])))
         sagitta = r - np.sqrt(max(0.0, r * r - (chord / 2) ** 2))
-        poly = _polyline_rms(contour, idx, i, j)
-        if res <= tol and 2.0 <= r < 1e4 and sagitta > tol and res <= 0.5 * poly:
+        if res <= tol and 2.0 <= r < 1e4 and sagitta > tol and _line_rms(pts) > tol:
             best = (j, c, r)
         else:
             break
@@ -227,20 +210,65 @@ def _line_run(contour: np.ndarray, idx: list, i: int, tol: float) -> int:
     return best
 
 
+def _ls_line(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Least-squares line through pts: (centroid, unit direction oriented from pts[0] to pts[-1])."""
+    c = pts.mean(0)
+    if len(pts) < 3:
+        d = pts[-1] - pts[0]
+    else:
+        _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+        d = vt[0]
+    n = float(np.hypot(*d))
+    d = d / n if n > 1e-9 else np.array([0.0, 1.0])
+    if np.dot(d, pts[-1] - pts[0]) < 0:
+        d = -d
+    return c, d
+
+
+def _project(line: tuple, p: np.ndarray) -> np.ndarray:
+    c, d = line
+    return c + d * float(np.dot(d, p - c))
+
+
+def _resolve_vertex(prev_line, next_line, vpos: np.ndarray, tol: float) -> np.ndarray:
+    """Position of the vertex shared by two runs. Two lines meet at their intersection (a diamond tip
+    is the meeting of its two locked sides) unless they are nearly parallel or the intersection is
+    further than 2 tol from the vertex, then at the mean of the two projections; a line and a
+    non-line meet on the line; otherwise the vertex position is kept."""
+    if prev_line is not None and next_line is not None:
+        (c1, d1), (c2, d2) = prev_line, next_line
+        cross = float(d1[0] * d2[1] - d1[1] * d2[0])
+        if abs(cross) >= 0.2:
+            w = c2 - c1
+            t = float(w[0] * d2[1] - w[1] * d2[0]) / cross
+            p = c1 + d1 * t
+            if np.hypot(*(p - vpos)) <= 2.0 * tol:
+                return p
+        return 0.5 * (_project(prev_line, vpos) + _project(next_line, vpos))
+    if prev_line is not None:
+        return _project(prev_line, vpos)
+    if next_line is not None:
+        return _project(next_line, vpos)
+    return vpos.copy()
+
+
 def regularize_contour(contour: np.ndarray, tol: float, min_line: int, free_runs: bool) -> tuple[np.ndarray, dict]:
     """contour: (N, 2) closed polyline (row, col). Returns (new polyline, segment class lengths).
 
     1. moving-average pre-smoothing, 2. Douglas-Peucker at `tol` (segmentation only),
     3. greedy runs over DP vertices: the longest of {line run (LS rms <= tol), arc run (circle rms <=
-    tol, sagitta > tol, >= 3 DP segments)} wins, a line on ties; a line run >= min_line is angle-locked;
-    a run shorter than min_line is a free segment (run-length median, endpoints kept)."""
+    tol, >= 8 knots, sagitta > tol, not a line within tol)} wins, a line on ties; a line run >= min_line
+    is angle-locked (direction snapped, line through the centroid of the run's points, accepted when
+    both end vertices stay within tol of it), a shorter one is a free segment (run-length median),
+    4. vertices between runs: two lines meet at their intersection, a line and a non-line on the line.
+    Placing every line through its centroid (not through one jittered vertex) makes the boundary of
+    a region and of its neighbour resolve to the same line."""
     orig = np.asarray(contour, dtype=np.float64)
     if len(orig) < 16:
         # a motif this small is pixel art: every knot was placed by hand, nothing to regularise
         return orig, {"line": 0.0, "arc": 0.0, "free": float(_length(orig))}
-    # the smoothed contour decides the segmentation (runs, classes); vertex positions and the points
-    # that are re-rasterised come from the original contour so that a convex corner (a diamond tip)
-    # is not pulled inward by the moving average
+    # the smoothed contour decides the segmentation (runs, classes) and the line fits; the points
+    # that are re-rasterised in arcs / free runs come from the original contour
     contour = _presmooth(orig)
     approx = approximate_polygon(contour, tolerance=tol)
     if len(approx) < 4:
@@ -252,42 +280,85 @@ def regularize_contour(contour: np.ndarray, tol: float, min_line: int, free_runs
             idx[k] = idx[k - 1] + 1
     idx = [min(i, len(contour) - 1) for i in idx]
     idx[-1] = len(contour) - 1
-    out = [orig[idx[0]].copy()]
+    # vertex positions: a DP vertex that turns sharply (a convex corner, a diamond tip) keeps its
+    # original position (the moving average pulls it inward); a vertex inside a gently bending or
+    # jittered run takes the smoothed position (the original one carries the +-1 knot jitter)
+    vpos = _vertex_positions(orig, contour, idx, corner_deg=30.0)
+    # pass 1: runs. Each run: (i, j, kind, line, data); line = (centroid, unit dir) for lines
+    runs = []
     i = 0
     while i < len(idx) - 1:
         jl = _line_run(contour, idx, i, tol)
         ja, c, r = _arc_run(contour, idx, i, tol)
-        pts = orig[idx[i]:idx[jl] + 1]
         if ja is not None and ja > jl:
-            pts = orig[idx[i]:idx[ja] + 1]
-            ang = np.arctan2(pts[:, 0] - c[0], pts[:, 1] - c[1])
-            snapped = np.column_stack([c[0] + r * np.sin(ang), c[1] + r * np.cos(ang)])
-            snapped[0], snapped[-1] = out[-1], pts[-1]
-            out.extend(snapped[1:].tolist())
-            stats["arc"] += float(_length(pts))
+            runs.append((i, ja, "arc", None, (c, r)))
             i = ja
             continue
-        a = np.asarray(out[-1], dtype=np.float64)
-        b = pts[-1].copy()
-        seg = b - a
-        L = float(np.hypot(*seg))
+        pts_s = contour[idx[i]:idx[jl] + 1]
+        L = float(np.hypot(*(vpos[jl] - vpos[i])))
         if L >= min_line:
-            theta = np.degrees(np.arctan2(seg[0], seg[1]))
-            d = np.array([np.sin(np.radians(_snap_angle(theta))), np.cos(np.radians(_snap_angle(theta)))])
-            if np.dot(d, seg) < 0:
+            cen, d_ls = _ls_line(pts_s)
+            theta = np.degrees(np.arctan2(d_ls[0], d_ls[1]))
+            snap = np.radians(_snap_angle(theta))
+            d = np.array([np.sin(snap), np.cos(snap)])
+            if np.dot(d, d_ls) < 0:
                 d = -d
-            b_new = a + d * L
-            if np.hypot(*(b_new - b)) <= tol:
-                b = b_new
-            out.append(b)
-            stats["line"] += L
+            locked = (cen, d)
+            dev = max(np.hypot(*(_project(locked, vpos[i]) - vpos[i])), np.hypot(*(_project(locked, vpos[jl]) - vpos[jl])))
+            runs.append((i, jl, "line", locked if dev <= tol else (cen, d_ls), None))
         else:
+            runs.append((i, jl, "free", None, None))
+        i = jl
+    # pass 2: vertices (closed contour: vertex 0 is shared by the last and the first run)
+    n = len(runs)
+    verts = []
+    for k in range(n + 1):
+        prev_run = runs[(k - 1) % n]
+        next_run = runs[k % n]
+        v = runs[k][0] if k < n else runs[-1][1]
+        verts.append(_resolve_vertex(prev_run[3], next_run[3], vpos[v], tol))
+    out = [verts[0]]
+    for k, (i, j, kind, line, data) in enumerate(runs):
+        a, b = verts[k], verts[k + 1]
+        pts = orig[idx[i]:idx[j] + 1]
+        if kind == "line":
+            out.append(b)
+            stats["line"] += float(np.hypot(*(b - a)))
+        elif kind == "arc":
+            c, r = data
+            ang = np.arctan2(pts[:, 0] - c[0], pts[:, 1] - c[1])
+            snapped = np.column_stack([c[0] + r * np.sin(ang), c[1] + r * np.cos(ang)])
+            snapped[0], snapped[-1] = a, b
+            out.extend(snapped[1:].tolist())
+            stats["arc"] += float(_length(pts))
+        else:
+            pts = pts.copy()
+            pts[0], pts[-1] = a, b
             fr = _free_run(pts, tol) if free_runs else pts
             out.extend(np.asarray(fr)[1:].tolist())
             stats["free"] += float(_length(pts))
-        i = jl
     out = np.array(out, dtype=np.float64)
     return out, stats
+
+
+def _vertex_positions(orig: np.ndarray, smooth: np.ndarray, idx: list, corner_deg: float) -> np.ndarray:
+    """Per DP vertex: the original contour point at a corner (turn >= corner_deg between the incoming
+    and outgoing DP segments), the smoothed point elsewhere. First and last vertex (same point on a
+    closed contour) follow the corner test of that point."""
+    n = len(idx)
+    pos = np.array([smooth[k] for k in idx], dtype=np.float64)
+    for v in range(n):
+        prev = idx[v - 1] if v > 0 else idx[n - 2]
+        nxt = idx[v + 1] if v < n - 1 else idx[1]
+        a = smooth[idx[v]] - smooth[prev]
+        b = smooth[nxt] - smooth[idx[v]]
+        na, nb = np.hypot(*a), np.hypot(*b)
+        if na < 1e-9 or nb < 1e-9:
+            continue
+        cosang = float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
+        if np.degrees(np.arccos(cosang)) >= corner_deg:
+            pos[v] = orig[idx[v]]
+    return pos
 
 
 def _length(pl: np.ndarray) -> float:

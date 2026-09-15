@@ -12,7 +12,18 @@ Spec deviations (scale invariance; see CLAUDE.md "Scale: measure in knots"):
   Canny map is still used for the layout (medallion) only.
 - the gradient-mask block test works on Lab smoothed at sigma = 2 knots (plane fit + edge test) and
   sigma = 8 knots (direction coherence); a plane must explain >= 0.6 of the sigma-2 variance.
+- gradient mask: after the 32-knot blocks (spec) a 16-knot pass and then every edge-free zone >= 64
+  knots are tested with the same ramp rule (same absolute Lab span); the three passes run at sigma = 2
+  and again at sigma = 4 knots (a sparse high-contrast dither is still texture at sigma 2); a region
+  whose projected end colours differ by less than that span is dropped (illumination / motif bleed),
+  and so is a region whose coarse labels carry too few single-knot dots (share below
+  GRADIENT_MIN_DITHER): a woven gradient is a dither of two yarns, a smooth ramp of label blobs is
+  illumination or pile shading.
 - `thin_line_frac` excludes the gradient mask (a dither checkerboard is not a drawn line).
+- `thin_line_frac` also counts the thin residue of non-thin components (component minus its
+  (w+1) x (w+1) opening, per connected piece through metrics.is_thin): in the coarse label map a
+  mixed-colour cell at a crossing glues two lines, or a line touches a motif of its colour, and
+  the merged component would otherwise drop out of the share entirely.
 """
 from __future__ import annotations
 
@@ -32,6 +43,7 @@ from .metrics import boundary_map, canny_L, component_area_map, connected_compon
 
 DETECT_CONF = 0.6          # detection threshold for symmetry / period / repeat / medallion
 GRAD_MIN_DEFAULT = 0.1     # Lab units per knot: a ramp must span >= 3.2 units over a 32-knot block
+GRADIENT_MIN_DITHER = 0.05  # share of a gradient region's knots that are single-knot dots of the other label (dither)
 GRAD_MAX_DEFAULT = 5.0     # Lab units per knot, upper bound (a step edge smoothed at sigma 2 is steeper)
 EDGE_L_PER_KNOT = 3.0      # |grad L| on the sigma-2-knot image above this is a step edge
 EDGE_MIN_COMPONENT = 8     # knots; boundaries of smaller components are texture, not edges
@@ -266,40 +278,49 @@ def gradient_mask(rect_rgb: np.ndarray, W: int, H: int, grad_min: float, grad_ma
     dropped. Returns (mask (H, W) bool, regions [{id, area_knots, direction, lab_lo, lab_hi, bbox}])."""
     lab = rgb_to_lab(rect_rgb)
     grid = [cv2.resize(lab[..., i].astype(np.float32), (W, H), interpolation=cv2.INTER_AREA) for i in range(3)]
-    sm2 = [cv2.GaussianBlur(g, (0, 0), 2.0) for g in grid]
-    # step edges in any Lab channel (a chroma-only edge is still an edge)
-    gmag = np.zeros((H, W), np.float32)
-    for f in sm2:
-        gmag += (cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3) / 8.0) ** 2 + (cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3) / 8.0) ** 2
-    edge = np.sqrt(gmag) > EDGE_L_PER_KNOT
-    # a step edge smoothed at sigma 2 is a band ~4 knots wide; a zone of high gradient that survives
-    # a 3-knot erosion is a steep ramp (a narrow two-colour gradient), not an edge
-    broad = ndi.binary_erosion(edge, iterations=3)
-    if broad.any():
-        broad = ndi.binary_dilation(broad, iterations=3) & edge
-        edge &= ~broad
-    # the transition tail of a blurred edge is a ramp too: exclude a band that grows with the blur
     kb = 2 * int(band_knots) + 1
-    valid = ~(cv2.dilate(edge.astype(np.uint8), np.ones((kb, kb), np.uint8)) > 0)
-    sm8 = [_nconv(g, valid, 8.0) for g in sm2]
-    g8 = [(cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3) / 8.0, cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3) / 8.0) for f in sm8]
+
+    def at_sigma(sigma: float):
+        sm = [cv2.GaussianBlur(g, (0, 0), sigma) for g in grid]
+        # step edges in any Lab channel (a chroma-only edge is still an edge)
+        gmag = np.zeros((H, W), np.float32)
+        for f in sm:
+            gmag += (cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3) / 8.0) ** 2 + (cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3) / 8.0) ** 2
+        edge = np.sqrt(gmag) > EDGE_L_PER_KNOT
+        # a step edge smoothed at sigma is a band ~2 sigma knots wide; a zone of high gradient that
+        # survives an erosion of 1.5 sigma is a steep ramp (a narrow two-colour gradient), not an edge
+        it = max(1, int(round(1.5 * sigma)))
+        broad = ndi.binary_erosion(edge, iterations=it)
+        if broad.any():
+            broad = ndi.binary_dilation(broad, iterations=it) & edge
+            edge &= ~broad
+        # the transition tail of a blurred edge is a ramp too: exclude a band that grows with the blur
+        valid = ~(cv2.dilate(edge.astype(np.uint8), np.ones((kb, kb), np.uint8)) > 0)
+        sm8 = [_nconv(g, valid, 8.0) for g in sm]
+        g8 = [(cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3) / 8.0, cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3) / 8.0) for f in sm8]
+        return sm, edge, valid, sm8, g8
+
+    sm2, edge, valid, sm8, g8 = at_sigma(2.0)
+    cur = {"sm": sm2, "edge": edge, "valid": valid, "g8": g8}
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
 
-    def block_is_ramp(ys, xs, g_min) -> bool:
+    def region_is_ramp(rm: np.ndarray, g_min: float, tag: tuple) -> bool:
+        """rm: bool (H, W) zone (a block or an edge-free zone). tag: debug key (y, x, size)."""
         def fail(reason):
             if debug is not None:
-                debug.append((ys.start, xs.start, ys.stop - ys.start, reason))
+                debug.append((*tag, reason))
             return False
-        if edge[ys, xs].mean() > edge_density_max:
+        edge_, valid_, sm_, g8_ = cur["edge"], cur["valid"], cur["sm"], cur["g8"]
+        if edge_[rm].mean() > edge_density_max:
             return fail("edges")
-        v = valid[ys, xs]
+        v = valid_ & rm
         n = int(v.sum())
-        if n < 0.5 * v.size or n < 16:
+        if n < 0.5 * int(rm.sum()) or n < 16:
             return fail("valid")
-        A = np.column_stack([xx[ys, xs][v], yy[ys, xs][v], np.ones(n, np.float32)])
+        A = np.column_stack([xx[v], yy[v], np.ones(n, np.float32)])
         slopes, r2s = [], []
         for c in range(3):
-            b = sm2[c][ys, xs][v]
+            b = sm_[c][v]
             coef, *_ = np.linalg.lstsq(A, b, rcond=None)
             resid = b - A @ coef
             var = float(b.var())
@@ -311,24 +332,48 @@ def gradient_mask(rect_rgb: np.ndarray, W: int, H: int, grad_min: float, grad_ma
         dom = int(np.argmax(slopes))
         if r2s[dom] < 0.6:
             return fail(f"r2={r2s[dom]:.2f}")
-        gx, gy = g8[dom]
-        mag = np.hypot(gx[ys, xs][v], gy[ys, xs][v]).mean()
-        coherence = float(np.hypot(gx[ys, xs][v].mean(), gy[ys, xs][v].mean()) / (mag + 1e-6))
+        gx, gy = g8_[dom]
+        mag = np.hypot(gx[v], gy[v]).mean()
+        coherence = float(np.hypot(gx[v].mean(), gy[v].mean()) / (mag + 1e-6))
         return coherence >= 0.8 or fail(f"coh={coherence:.2f}")
 
     mask = np.zeros((H, W), dtype=bool)
-    # 32-knot blocks first (spec), then half-size blocks for what is left so that a region boundary
-    # or a second gradient region inside a block does not cost a whole 32-knot band. The ramp must
-    # span the same absolute Lab range whatever the block size (grad_min is per 32 knots).
-    for bk in (block_knots, max(8, block_knots // 2)):
-        g_min = grad_min * block_knots / bk
-        for y in range(0, H, bk):
-            for x in range(0, W, bk):
-                ys, xs = slice(y, min(H, y + bk)), slice(x, min(W, x + bk))
-                if mask[ys, xs].all():
-                    continue
-                if block_is_ramp(ys, xs, g_min):
-                    mask[ys, xs] = True
+    # Passes at sigma = 2 knots (spec scale), then at sigma = 4 for what is left: a sparse ordered
+    # dither of two far-apart colours (dots every ~8 knots) keeps ~30 % of its amplitude at sigma 2
+    # and reads as edges, at sigma 4 it is a ramp again while a real step edge still exceeds
+    # EDGE_L_PER_KNOT.
+    for sigma in (2.0, 4.0):
+        if sigma != 2.0:
+            sm_s, edge_s, valid_s, _, g8_s = at_sigma(sigma)
+            cur = {"sm": sm_s, "edge": edge_s, "valid": valid_s, "g8": g8_s}
+        # 32-knot blocks first (spec), then half-size blocks for what is left so that a region
+        # boundary or a second gradient region inside a block does not cost a whole 32-knot band. The
+        # ramp must span the same absolute Lab range whatever the block size (grad_min is per 32 knots).
+        for bk in (block_knots, max(8, block_knots // 2)):
+            g_min = grad_min * block_knots / bk
+            for y in range(0, H, bk):
+                for x in range(0, W, bk):
+                    ys, xs = slice(y, min(H, y + bk)), slice(x, min(W, x + bk))
+                    if mask[ys, xs].all():
+                        continue
+                    rm = np.zeros((H, W), dtype=bool)
+                    rm[ys, xs] = True
+                    if region_is_ramp(rm, g_min, (y, x, bk)):
+                        mask[ys, xs] = True
+        # a gradient panel inside a hard outline (a dithered rectangle on a plain ground) is smaller
+        # than or misaligned with the block lattice and every block through its outline fails the
+        # edge test: each edge-free zone (4-connected, >= 64 knots) not yet covered is tested as one
+        # block of its own size (same absolute Lab span rule, never below grad_min)
+        zones, nz = ndi.label(cur["valid"] & ~mask)
+        for i in range(1, nz + 1):
+            rm = zones == i
+            area = int(rm.sum())
+            if area < 64:
+                continue
+            g_min = max(grad_min, grad_min * block_knots / np.sqrt(area))
+            ys_, xs_ = np.nonzero(rm)
+            if region_is_ramp(rm, g_min, (int(ys_.min()), int(xs_.min()), 0)):
+                mask |= rm
     regions = []
     if mask.any():
         # cell-level growth into the excluded edge band: a cell up to 6 knots from a region whose
@@ -376,11 +421,52 @@ def gradient_mask(rect_rgb: np.ndarray, W: int, H: int, grad_min: float, grad_ma
             sel_lo, sel_hi = proj <= lo + 1e-6, proj >= hi - 1e-6
             lab_lo = [float(Lg[rm][sel_lo].mean()), float(ag[rm][sel_lo].mean()), float(bg[rm][sel_lo].mean())]
             lab_hi = [float(Lg[rm][sel_hi].mean()), float(ag[rm][sel_hi].mean()), float(bg[rm][sel_hi].mean())]
+            if float(delta_e2000(np.array(lab_lo), np.array(lab_hi))) < min_range:
+                # the ends of the ramp are the same yarn: the sigma-8 range came from a neighbouring
+                # motif bleeding into the smoothing, not from a designed gradient
+                keep &= ~rm
+                continue
             regions.append({"id": len(regions), "area_knots": int(sz), "direction": d.tolist(),
                             "lab_lo": lab_lo, "lab_hi": lab_hi,
                             "bbox": [int(xs_.min()), int(ys_.min()), int(xs_.max()), int(ys_.max())]})
         mask = keep
     return mask, regions
+
+
+def drop_undithered_regions(gmask: np.ndarray, regions: list, labels: np.ndarray, min_dither: float) -> tuple[np.ndarray, list]:
+    """A Wilton gradient can only be woven as a dither of two yarns, so inside a real gradient region
+    the coarse label map carries single-knot dots (or holes): knots whose four 4-neighbours all share
+    one label different from the knot's own. A smooth ramp (illumination residual in a corner, pile
+    shading split into two labels, a blurred motif edge) is made of blobs: k-means fragments of
+    shading are never single knots because shading varies over several knots. Regions whose share of
+    such dots (`dither_share`) is below `min_dither` are removed; the share is recorded per region.
+    Limitation: a dither drawn with dots of 2+ knots is not recognised and is treated as a ramp of
+    the yarns it is made of (quantize path, no dither stage)."""
+    if not regions or not gmask.any():
+        return gmask, regions
+    pd = np.pad(labels, 1, mode="edge")
+    up, dn, lf, rt = pd[:-2, 1:-1], pd[2:, 1:-1], pd[1:-1, :-2], pd[1:-1, 2:]
+    dots = (up == dn) & (up == lf) & (up == rt) & (up != labels)
+    lab_m, n = ndi.label(gmask)
+    keep = np.zeros_like(gmask)
+    out = []
+    claimed = np.zeros_like(gmask)
+    for r in regions:
+        x0, y0, x1, y1 = r["bbox"]
+        ids = np.unique(lab_m[y0:y1 + 1, x0:x1 + 1][gmask[y0:y1 + 1, x0:x1 + 1]])
+        rm = np.isin(lab_m, ids) & gmask & ~claimed
+        if not rm.any():
+            continue
+        claimed |= rm
+        share = float(dots[rm].mean())
+        r = dict(r, dither_share=share)
+        if share < min_dither:
+            continue
+        keep |= rm
+        out.append(r)
+    for i, r in enumerate(out):
+        r["id"] = i
+    return keep, out
 
 
 # ----------------------------------------------------------------------------- 6. coarse labels
@@ -486,14 +572,34 @@ def _absorb_transition_bands(labels: np.ndarray, glab: np.ndarray, centers: np.n
 
 def thin_line_frac(labels: np.ndarray, line_min_knots: int, line_max_width: int,
                    valid: Optional[np.ndarray] = None) -> float:
-    """Knot share of is_thin components of the coarse label map (cells with valid == False, i.e. the
-    gradient mask, are excluded). Transition bands are already absorbed by coarse_labels."""
+    """Knot share of drawn thin lines in the coarse label map (cells with valid == False, i.e. the
+    gradient mask, are excluded). Transition bands are already absorbed by coarse_labels.
+
+    A component that is thin as a whole (metrics.is_thin) counts fully. A component that is not
+    (two lines glued by a mixed-colour cell at a crossing, a line touching a motif of its colour) is
+    opened with a (w+1) x (w+1) block: what the opening removes is at most w wide and every
+    connected piece of it that is itself a thin line counts. A solid motif leaves no such residue
+    (every boundary cell of a convex region lies in a full block; only 1-wide protrusions survive).
+    """
     total = 0
+    k = int(line_max_width) + 1
+    block = np.ones((k, k), bool)
     for c in connected_components(labels, valid):
         if c.area < line_min_knots:
             continue
-        if is_thin(c.full_mask(labels.shape), line_min_knots, line_max_width):
+        fm = c.full_mask(labels.shape)
+        if is_thin(fm, line_min_knots, line_max_width):
             total += c.area
+            continue
+        opened = ndi.binary_dilation(ndi.binary_erosion(fm, structure=block, border_value=0), structure=block)
+        residue = fm & ~opened
+        if residue.sum() < line_min_knots:
+            continue
+        pieces, n = ndi.label(residue, structure=np.ones((3, 3), bool))
+        for i in range(1, n + 1):
+            piece = pieces == i
+            if piece.sum() >= line_min_knots and is_thin(piece, line_min_knots, line_max_width):
+                total += int(piece.sum())
     return float(total / labels.size)
 
 
@@ -781,10 +887,11 @@ def _analyse(job: Job, rect: np.ndarray, con: np.ndarray, W: int, H: int, sd: Pa
     ew = float(grid.get("edge_width_knots") or 1.0)
     gmask, gregions = gradient_mask(rect, W, H, float(P.get("grad_min", GRAD_MIN_DEFAULT)),
                                     float(P.get("grad_max", GRAD_MAX_DEFAULT)), band_knots=max(2, int(round(2 + 2 * ew))))
+    labels, centers = coarse_labels(rect, W, H)
+    gmask, gregions = drop_undithered_regions(gmask, gregions, labels, float(P.get("gradient_min_dither", GRADIENT_MIN_DITHER)))
     gradient_frac = float(gmask.mean())
     # knot-scale features ignore a 3-knot band around the mask: its boundary is uncertain by that much
     feat_valid = ~(ndi.binary_dilation(gmask, iterations=3) if gmask.any() else gmask)
-    labels, centers = coarse_labels(rect, W, H)
     # 2./3. border + period
     border = detect_border(labels, float(P.get("border_frac_min", 0.03)), float(P.get("border_frac_max", 0.30)),
                            PX_PER_KNOT / scale)

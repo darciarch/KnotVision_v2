@@ -84,7 +84,10 @@ def test_large_shift_triggers_edit_drift(geometric_pair, tmp_root, mock_agent):
 
 
 def test_added_block_raises_added_pct_and_feedback_prompt(geometric_pair, tmp_root, mock_agent):
-    a = mock_agent("t_mock_add", mock={"mode": "add_block", "block": [60, 60, 140, 140], "color": [255, 0, 255]},
+    # the block takes a palette colour that is not the ground there (a foreign colour would quantise to
+    # the nearest yarn, and on this pink-ground fixture that is the ground itself: a *missing*, not an
+    # *added* motif); the geometric fixture's blue is [46, 101, 170] before white balance
+    a = mock_agent("t_mock_add", mock={"mode": "add_block", "block": [60, 60, 140, 140], "color": [40, 100, 170]},
                    edit_n_candidates=1, edit_max_rounds=2)
     job = _edit_job(geometric_pair, tmp_root, a, "edit_added", override={"edit_gain_tol": 1.0})
     rep = run(job)

@@ -3,6 +3,11 @@
 candidates -> align (knotvision.align) -> quick quantize (production.quick_quantize) -> features vs
 ref_indexed -> weighted selection -> stop / feedback -> next round. Wall-clock cap edit_max_wall_s.
 Cost accounting for API backends. Everything is written under stages/05_design/edit/.
+
+Spec deviations:
+- `palette_deltaE_p95` of a candidate is the per-knot (centre 2x2 px) excess of its palette distance
+  over the rectified photo's own distance at that knot, not an absolute per-pixel p95: pile shading
+  and blur mixes are not invented colours, and the spec's mock identity backend must stop the loop.
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ from ..color import rgb_to_lab, delta_e2000
 from ..job import dump_json
 from ..metrics import edge_fidelity, edit_added_missing, line_jaggedness, noise_stats
 from ..production import quick_quantize
+from ..structure import knot_centre_rgb
 from . import prompts as PR
 from .base import Backend, BackendError
 
@@ -78,9 +84,18 @@ def candidate_features(cand_aligned: np.ndarray, rectified: np.ndarray, ref_inde
                        palette_lab: np.ndarray, W: int, H: int, params: dict, gmask: Optional[np.ndarray],
                        align_px: dict) -> tuple[dict, np.ndarray]:
     indexed_cand, _ = quick_quantize(cand_aligned, palette_lab, W, H)
-    lab = rgb_to_lab(cand_aligned).reshape(-1, 3)
+    # palette distance per knot (centre 2x2 px, CLAUDE.md: measure in knots), as the *excess* of the
+    # candidate's deviation over the rectified photo's own deviation at the same knot: pile shading
+    # and blur mixes are in every candidate, the photo included, and are not colours the model
+    # invented. The spec's mock identity backend ("return identity -> loop must stop") requires the
+    # photo itself to pass this gate, which an absolute per-pixel p95 (10-14 on a real photo, the
+    # QC feature of the same name) cannot.
+    lab = rgb_to_lab(knot_centre_rgb(cand_aligned, W, H)).reshape(-1, 3)
+    lab_ref = rgb_to_lab(knot_centre_rgb(rectified, W, H)).reshape(-1, 3)
     step = max(1, lab.shape[0] // 50000)
     d = delta_e2000(lab[::step][:, None, :], palette_lab[None, :, :]).min(axis=1)
+    d_ref = delta_e2000(lab_ref[::step][:, None, :], palette_lab[None, :, :]).min(axis=1)
+    d = np.maximum(0.0, d - d_ref)
     added, missing = edit_added_missing(indexed_cand, ref_indexed, int(params.get("motif_min_knots", 10)), gmask)
     ns = noise_stats(indexed_cand, None if gmask is None else ~gmask, int(params.get("noise_cc_min", 2)),
                      int(params.get("noise_cc_max", 6)), int(params.get("min_region_knots", 2)))

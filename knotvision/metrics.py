@@ -113,6 +113,33 @@ def canny_L(img_rgb: np.ndarray, radius: int = 8, lo: int = 40, hi: int = 100) -
     return cv2.Canny(L8, lo, hi) > 0
 
 
+def lab_gradients(img_rgb: np.ndarray, smooth_ksize: int = 3) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(lab float32 (H, W, 3), gx (H, W, 3), gy (H, W, 3)): Sobel-3 gradients of every Lab channel of
+    the lightly smoothed image. Single home of the colour-edge gradient (rectify, palette)."""
+    lab = rgb_to_lab(img_rgb).astype(np.float32)
+    lab_s = cv2.GaussianBlur(lab, (smooth_ksize, smooth_ksize), 0) if smooth_ksize > 1 else lab
+    gx = cv2.Sobel(lab_s, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(lab_s, cv2.CV_32F, 0, 1, ksize=3)
+    return lab, gx, gy
+
+
+def canny_from_gradients(gx: np.ndarray, gy: np.ndarray, lo: int = 40, hi: int = 100) -> np.ndarray:
+    """Colour Canny on per-channel Lab gradients (OpenCV's multi-channel rule: per pixel the channel
+    with the strongest gradient). Thresholds are on the 8-bit scale of canny_L (Lab units x 2.55), so
+    a chroma-only edge (two yarns of equal lightness) counts like a lightness edge of the same size."""
+    dx16 = np.clip(gx * 2.55, -32000, 32000).astype(np.int16)
+    dy16 = np.clip(gy * 2.55, -32000, 32000).astype(np.int16)
+    return cv2.Canny(dx16, dy16, lo, hi, L2gradient=True) > 0
+
+
+def canny_lab(img_rgb: np.ndarray, radius: Optional[int] = 8, lo: int = 40, hi: int = 100) -> np.ndarray:
+    """guided filter (r=radius, None = off) + colour (Lab) Canny -> bool edge map. The colour
+    counterpart of canny_L for images whose edges may be chroma-only."""
+    g = guided(img_rgb, radius=radius, eps=0.01) if radius else img_rgb
+    _, gx, gy = lab_gradients(g)
+    return canny_from_gradients(gx, gy, lo, hi)
+
+
 def edge_density(img_rgb: np.ndarray) -> float:
     e = canny_L(img_rgb)
     return float(e.mean())
@@ -306,10 +333,15 @@ def thin_line_recall(output: np.ndarray, truth: np.ndarray, line_min_knots: int 
 
 def noise_stats(indexed: np.ndarray, valid: Optional[np.ndarray], cc_min: int, cc_max: int,
                 min_region_knots: int) -> dict:
-    """noise_frac (area in [cc_min, cc_max]), noise_1knot_frac (area == 1), noise_knots_frac (area <= min_region)."""
+    """noise_frac (area in [cc_min, cc_max]), noise_1knot_frac (area == 1), noise_knots_frac (area <= min_region).
+
+    Knot shares of the whole map (spec: "dugum orani"; the generator's meta uses the same denominator):
+    cells with valid == False (the gradient mask, where dither is not noise) are excluded from the
+    count but not from the denominator, so that a rug that is mostly gradient does not report the
+    speckle of its last uncovered strip as if it were the whole rug."""
     area = component_area_map(indexed)
     v = np.ones(indexed.shape, dtype=bool) if valid is None else valid
-    total = max(1, int(v.sum()))
+    total = max(1, int(indexed.size))
     return {
         "noise_frac": float(((area >= cc_min) & (area <= cc_max) & v).sum() / total),
         "noise_1knot_frac": float(((area == 1) & v).sum() / total),

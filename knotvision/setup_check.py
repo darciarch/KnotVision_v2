@@ -38,14 +38,24 @@ def check(profile_name: str = "wilton_default", probe_api: bool = False) -> list
         "noise_frac / distressed detection use assumed scale (tools/noise_stats.py)", assumed=True)
     add("qc_calib", (MODELS_DIR / "qc_calib.json").exists(), "models/qc_calib.json",
         "needs_review on every job: score computed, no decision (eval/calibrate_qc.py)")
-    add("sam", (MODELS_DIR / "sam3.1").exists(), "models/sam3.1/",
-        "sam_unavailable -> needs_corners on every job without corners_override")
+    sam_ok = any((MODELS_DIR / "sam3.1").glob("*.pt")) if (MODELS_DIR / "sam3.1").exists() else False
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # sam3 decorates CUDA autocast at import time
+            import torch  # noqa: F401
+            import sam3  # noqa: F401
+        sam_pkg = True
+    except Exception:
+        sam_pkg = False
+    add("sam", sam_ok and sam_pkg, f"models/sam3.1/*.pt ({'found' if sam_ok else 'missing'}), sam3+torch package "
+        f"({'ok' if sam_pkg else 'missing'})", "sam_unavailable -> needs_corners on every job without corners_override")
     add("segment_ckpt", (MODELS_DIR / "knotvision_segment.pt").exists(), "models/knotvision_segment.pt",
         "design_mode: segment falls back to quantize (segment_fallback) (train/train_segment.py)")
     agents = sorted(p.stem for p in (CONFIG_DIR / "agents").glob("*.yaml"))
     add("edit_agents", bool(agents), ", ".join(agents), "design_mode: edit raises edit_agent_missing")
     for name, d in (("qwen_edit_2511", "qwen_image_edit_2511"), ("qwen_edit_2509", "qwen_image_edit_2509")):
-        add(f"edit_backend:{name}", (MODELS_DIR / d).exists(), f"models/{d}/",
+        add(f"edit_backend:{name}", _hf_snapshot_complete(MODELS_DIR / d), f"models/{d}/",
             f"{name} agents -> edit_backend_error -> edit_fallback (quantize baseline)")
     key = bool(os.environ.get("MUSE_API_KEY"))
     allow = bool(P.get("allow_api"))
@@ -62,6 +72,25 @@ def check(profile_name: str = "wilton_default", probe_api: bool = False) -> list
         add(f"class:{name}", (CONFIG_DIR / "classes" / f"{name}.yaml").exists(), f"config/classes/{name}.yaml",
             "class_config_missing for jobs of this class")
     return items
+
+
+def _hf_snapshot_complete(d: Path) -> bool:
+    """A diffusers snapshot counts only when model_index.json exists, every safetensors shard listed
+    in the transformer / text_encoder index files is present, and no `hf download` `.incomplete`
+    part is left behind (an interrupted download leaves the directory in place)."""
+    if not (d / "model_index.json").exists():
+        return False
+    if any(d.rglob("*.incomplete")):
+        return False
+    import json
+    for idx in d.glob("*/*.safetensors.index.json"):
+        try:
+            names = set(json.loads(idx.read_text()).get("weight_map", {}).values())
+        except Exception:
+            return False
+        if any(not (idx.parent / n).exists() for n in names):
+            return False
+    return True
 
 
 def format_report(items: list[dict]) -> str:

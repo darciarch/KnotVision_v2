@@ -46,9 +46,9 @@ STAGE_PARAM_KEYS = {
     # design_mode / edit_thin_line_max are NOT here: routing is re-applied from layout.json on a cache hit
     "structure": ("border_frac_min", "border_frac_max", "grad_min", "grad_max", "noise_cc_min", "noise_cc_max",
                   "min_region_knots", "line_min_knots", "line_max_width", "edge_density_min", "gradient_class_frac",
-                  "noise_class_frac", "class_margin_min", "planarity_warn", "grid_mismatch_tol"),
+                  "noise_class_frac", "class_margin_min", "planarity_warn", "grid_mismatch_tol", "gradient_min_dither"),
     "palette": ("area_weight_exp", "adjacency_penalty", "gain_stop_select", "merge_cost_stop",
-                "motif_color_min_cc", "motif_min_knots"),
+                "motif_color_min_cc", "motif_min_knots", "noise_cc_max"),
     "design_baseline": (),
     "production": ("boundary_thr", "boundary_snap_r", "noise_cc_min", "noise_cc_max", "min_region_knots",
                    "min_coverage_pct", "line_min_knots", "line_max_width", "motif_min_knots", "motif_color_min_cc",

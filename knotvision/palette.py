@@ -9,7 +9,9 @@
    machine_colors then continue while cost < merge_cost_stop). Gradient endpoints are never merged.
 4. Motif-colour protection: clusters with small coverage but >= motif_color_min_cc components or a
    largest component >= motif_min_knots are merged last. Protection is evaluated after k-means
-   duplicates (deltaE < DUP_DE) are merged, otherwise fragments of one flat colour look like motifs.
+   duplicates (deltaE < DUP_DE) are merged, otherwise fragments of one flat colour look like motifs;
+   pile-shading variants (deltaE < SHADE_DE meeting along boundaries without a colour edge) and
+   transition mixes (a small cluster on the Lab segment between its two neighbours) merge likewise.
 5. palette.json, palette_proposed.json, palette_card.png
 Output: palette.json, palette_proposed.json, palette_card.png
 """
@@ -26,7 +28,7 @@ from sklearn.cluster import KMeans
 
 from .color import delta_e2000, hex_of, lab_to_rgb, rgb_to_lab
 from .job import Job, dump_json, read_json
-from .metrics import canny_L, guided
+from .metrics import canny_lab, guided
 
 
 def _resize_long(img, long_px):
@@ -49,8 +51,10 @@ def cluster_photo(rect_rgb: np.ndarray, gmask_grid: Optional[np.ndarray], machin
         gm = cv2.resize(gmask_grid.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
     else:
         gm = np.zeros((h, w), dtype=bool)
-    # pixels within 2 px of an edge are pile-blur transition colours, not yarns: excluded from the fit
-    band = cv2.dilate(canny_L(small).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    # pixels within 2 px of an edge are pile-blur transition colours, not yarns: excluded from the fit.
+    # Colour edges: two yarns of equal lightness (a common two-colour rug) have no L edge, and their
+    # transition band would otherwise enter the k-means as a chroma ramp of fake yarns.
+    band = cv2.dilate(canny_lab(small).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     k = min(4 * machine_colors, max(2, (~gm).sum() // 50))
     flat = lab.reshape(-1, 3)
     valid = (~gm & ~band).reshape(-1)
@@ -61,6 +65,7 @@ def cluster_photo(rect_rgb: np.ndarray, gmask_grid: Optional[np.ndarray], machin
     labels_img = np.full(h * w, -1, dtype=np.int32)
     labels_img[valid] = km.labels_
     labels_img = labels_img.reshape(h, w)
+    raw_labels = labels_img.copy()   # -1 in the edge band: adjacency here is a soft boundary
     # fill the band with the nearest labelled pixel so that adjacency is measured across it
     if (labels_img < 0).any() and (labels_img >= 0).any():
         _, (iy, ix) = ndi.distance_transform_edt(labels_img < 0, return_indices=True)
@@ -79,23 +84,34 @@ def cluster_photo(rect_rgb: np.ndarray, gmask_grid: Optional[np.ndarray], machin
             counts = np.append(counts, 0.0)
             forced = np.append(forced, True)
             endpoint_of.append((r["id"], end))
-    # adjacency (400 px): shared boundary pixels between clusters, excluding gradient-mask boundaries
+    # adjacency (400 px): shared boundary pixels between clusters, excluding gradient-mask boundaries.
+    # adj: across the filled edge band (motif boundaries); adj_soft: only pairs where neither pixel
+    # lies in the band, i.e. boundaries with no colour edge (pile shading inside one yarn)
     n = len(centers)
-    adj = np.zeros((n, n), dtype=np.float64)
-    a, b = labels_img[:, :-1], labels_img[:, 1:]
-    m = (a != b) & (a >= 0) & (b >= 0) & ~gm[:, :-1] & ~gm[:, 1:]
-    np.add.at(adj, (a[m], b[m]), 1)
-    a, b = labels_img[:-1, :], labels_img[1:, :]
-    m = (a != b) & (a >= 0) & (b >= 0) & ~gm[:-1, :] & ~gm[1:, :]
-    np.add.at(adj, (a[m], b[m]), 1)
-    adj = adj + adj.T
+
+    def adjacency(li):
+        m_ = np.zeros((n, n), dtype=np.float64)
+        a, b = li[:, :-1], li[:, 1:]
+        m = (a != b) & (a >= 0) & (b >= 0) & ~gm[:, :-1] & ~gm[:, 1:]
+        np.add.at(m_, (a[m], b[m]), 1)
+        a, b = li[:-1, :], li[1:, :]
+        m = (a != b) & (a >= 0) & (b >= 0) & ~gm[:-1, :] & ~gm[1:, :]
+        np.add.at(m_, (a[m], b[m]), 1)
+        return m_ + m_.T
+
+    adj = adjacency(labels_img)
+    adj_soft = adjacency(raw_labels)
     return {"centers": centers, "weights": weights, "counts": counts, "forced": forced,
-            "endpoint_of": endpoint_of, "adj": adj, "labels_img": labels_img, "lab_small": lab, "gm_small": gm}
+            "endpoint_of": endpoint_of, "adj": adj, "adj_soft": adj_soft, "labels_img": labels_img,
+            "lab_small": lab, "gm_small": gm}
 
 
 # ----------------------------------------------------------------------------- motif-colour protection
 
 DUP_DE = 2.5   # clusters closer than this are the same yarn split by k-means; they merge before anything else
+SHADE_DE = 8.0   # up to this deltaE two clusters whose common boundary is mostly soft (no colour edge) are
+                 # pile-shading variants of one yarn and merge at no cost like duplicates; the same 8 units
+                 # as structure.coarse_labels' merge_de (centres closer than that are one yarn)
 
 
 def _group_label_image(cl: dict, groups: list[list[int]]) -> np.ndarray:
@@ -108,11 +124,13 @@ def _group_label_image(cl: dict, groups: list[list[int]]) -> np.ndarray:
 
 
 def motif_protected(cl: dict, motif_color_min_cc: int, motif_min_knots: int, W: int, H: int,
-                    groups: Optional[list[list[int]]] = None) -> np.ndarray:
+                    groups: Optional[list[list[int]]] = None, cc_min_knots: int = 7) -> np.ndarray:
     """Colours whose coverage is small but that form >= motif_color_min_cc components or one
     component >= motif_min_knots (measured on the 400 px label image, scaled to knots). Evaluated per
     cluster, or per group when `groups` is given (k-means fragments of one flat colour look like many
-    components; dedup first, then protect)."""
+    components; dedup first, then protect). Only components of >= cc_min_knots knots count towards
+    motif_color_min_cc: pile-shading speckle of a big colour is many knot-scale blobs (noise_cc_max
+    and below, the spec's noise scale), a motif colour is drawn in larger pieces."""
     labels_img = cl["labels_img"] if groups is None else _group_label_image(cl, groups)
     h, w = labels_img.shape
     knots_per_px = (W * H) / float(h * w)
@@ -125,13 +143,11 @@ def motif_protected(cl: dict, motif_color_min_cc: int, motif_min_knots: int, W: 
         if cov == 0 or cov > 0.05:
             continue
         lab, ncc = ndi.label(m)
-        if ncc >= motif_color_min_cc:
-            prot[i] = True
+        if ncc == 0:
             continue
-        if ncc:
-            largest = ndi.sum(m, lab, index=np.arange(1, ncc + 1)).max() * knots_per_px
-            if largest >= motif_min_knots:
-                prot[i] = True
+        sizes = ndi.sum(m, lab, index=np.arange(1, ncc + 1)) * knots_per_px
+        if int((sizes >= cc_min_knots).sum()) >= motif_color_min_cc or sizes.max() >= motif_min_knots:
+            prot[i] = True
     return prot
 
 
@@ -143,6 +159,7 @@ class _Groups:
     def __init__(self, cl: dict, groups: Optional[list[list[int]]] = None):
         centers, weights, forced = cl["centers"], cl["weights"], cl["forced"]
         self.adj = cl["adj"]
+        self.adj_soft = cl.get("adj_soft", np.zeros_like(self.adj))
         self.total_adj = self.adj.sum() / 2 + 1e-9
         self.groups = [list(g) for g in groups] if groups is not None else [[i] for i in range(len(centers))]
         self.cent, self.w, self.forced = [], [], []
@@ -158,6 +175,13 @@ class _Groups:
 
     def shared(self, a: int, b: int) -> float:
         return float(sum(self.adj[i, j] for i in self.groups[a] for j in self.groups[b]))
+
+    def soft_share(self, a: int, b: int) -> float:
+        """Share of the common boundary that carries no colour edge (0 when there is no boundary)."""
+        tot = self.shared(a, b)
+        if tot <= 0:
+            return 0.0
+        return float(sum(self.adj_soft[i, j] for i in self.groups[a] for j in self.groups[b])) / tot
 
     def merge(self, a: int, b: int):
         if self.forced[b] and not self.forced[a]:
@@ -205,6 +229,7 @@ def merge_clusters(cl: dict, machine_colors: int, adjacency_penalty: float, merg
             protected = np.array([all(bool(protected[i]) for i in g) for g in groups])
     G = _Groups(cl, groups)
     gprot = [bool(x) for x in protected] if protected is not None and len(protected) == len(groups) else [False] * len(groups)
+    _fold_transitions(G, gprot)
     while len(G.groups) > 1:
         best = None
         for a in range(len(G.groups)):
@@ -214,10 +239,16 @@ def merge_clusters(cl: dict, machine_colors: int, adjacency_penalty: float, merg
                 de = float(delta_e2000(G.cent[a], G.cent[b]))
                 if (G.forced[a] or G.forced[b]) and de > DUP_DE:
                     continue   # a forced endpoint may absorb a free cluster only if it is the same colour
-                wa, wb = G.w[a], G.w[b]
-                cost = de * min(wa, wb) / (wa + wb) + adjacency_penalty * G.shared(a, b) / G.total_adj
-                if (gprot[a] or gprot[b]) and de > DUP_DE:
-                    cost += 1e3
+                if de < DUP_DE or (de < SHADE_DE and not (G.forced[a] or G.forced[b]) and G.soft_share(a, b) >= 0.5):
+                    # merged centres drift: two groups that became the same colour are still duplicates;
+                    # two close colours meeting mostly along soft boundaries are shading of one yarn.
+                    # Both merge at no cost (the adjacency penalty is for motif boundaries)
+                    cost = 0.0
+                else:
+                    wa, wb = G.w[a], G.w[b]
+                    cost = de * min(wa, wb) / (wa + wb) + adjacency_penalty * G.shared(a, b) / G.total_adj
+                    if (gprot[a] or gprot[b]) and de >= SHADE_DE:
+                        cost += 1e3   # protection only keeps a motif colour apart from a *different* colour
                 if best is None or cost < best[0]:
                     best = (cost, a, b)
         if best is None:
@@ -230,6 +261,42 @@ def merge_clusters(cl: dict, machine_colors: int, adjacency_penalty: float, merg
         gprot[a] = pa and pb
         del gprot[b]
     return G.groups
+
+
+def _fold_transitions(G: "_Groups", gprot: list, max_share: float = 0.05, band: float = 0.35) -> None:
+    """Fold pile-blur transition colours: a small, unprotected, unforced group whose centre lies on the
+    Lab segment between its two most adjacent larger neighbours (within `band` of the segment length)
+    is the mix of those two yarns, not a yarn (the counterpart of structure._absorb_transition_bands
+    at palette level; a chroma ramp between two isoluminant yarns would otherwise survive the L-edge
+    band and the cost merge as a run of fake yarns). Smallest group first, lowest id on ties; repeats
+    until stable. Merges into the nearer neighbour at no cost."""
+    changed = True
+    while changed and len(G.groups) > 2:
+        changed = False
+        total_w = sum(G.w) + 1e-9
+        order = sorted(range(len(G.groups)), key=lambda i: (G.w[i], min(G.groups[i])))
+        for g in order:
+            if G.forced[g] or gprot[g] or G.w[g] / total_w > max_share:
+                continue
+            nb = sorted((i for i in range(len(G.groups)) if i != g and G.w[i] > G.w[g]),
+                        key=lambda i: (-G.shared(g, i), i))
+            if len(nb) < 2 or G.shared(g, nb[1]) <= 0:
+                continue
+            a, b = nb[0], nb[1]
+            ab = G.cent[b] - G.cent[a]
+            L2 = float(ab @ ab) + 1e-9
+            t = float(((G.cent[g] - G.cent[a]) @ ab) / L2)
+            perp = float(np.linalg.norm(G.cent[g] - (G.cent[a] + t * ab)))
+            if not (0.0 <= t <= 1.0 and perp < band * np.sqrt(L2)):
+                continue
+            da, db = float(delta_e2000(G.cent[g], G.cent[a])), float(delta_e2000(G.cent[g], G.cent[b]))
+            keep = a if da <= db else b
+            pk = gprot[keep]
+            keep, gone = G.merge(keep, g)
+            gprot[keep] = pk
+            del gprot[gone]
+            changed = True
+            break
 
 
 def select_from_library(cl: dict, yarn_lab: np.ndarray, yarns: list, machine_colors: int,
@@ -326,7 +393,8 @@ def run(job: Job) -> dict:
         source = "library"
     else:
         groups0 = dedup_groups(cl)
-        prot = motif_protected(cl, int(P.get("motif_color_min_cc", 5)), int(P.get("motif_min_knots", 10)), W, H, groups=groups0)
+        prot = motif_protected(cl, int(P.get("motif_color_min_cc", 5)), int(P.get("motif_min_knots", 10)), W, H, groups=groups0,
+                               cc_min_knots=int(P.get("noise_cc_max", 6)) + 1)
         groups = merge_clusters(cl, mc, float(P.get("adjacency_penalty", 2.0)), float(P.get("merge_cost_stop", 0.5)), prot, groups=groups0)
         # order: coverage descending, lowest original id on ties
         def cov(g):

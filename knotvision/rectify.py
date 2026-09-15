@@ -9,8 +9,11 @@ Spec deviations:
 - the outermost knot ring of the rectified image is replaced by its inner neighbour ring: at the pile
   edge the photo blends rug and background (blur, shadow), and that blend would otherwise become a
   one-knot frame in the design and a spurious thin line / colour in every downstream measurement.
-- edge_width_knots is measured on axis-aligned edges when enough exist (a diagonal staircase is
-  wider than the optical blur) and with sub-sample 10 % / 90 % crossings.
+- edge_width_knots is measured on colour (Lab) edges, on axis-aligned edges when enough exist (a
+  diagonal staircase is wider than the optical blur), with sub-sample 10 % / 90 % crossings, and
+  the median is taken over resolved profiles only (both ends on a plateau >= 1.5 knots): an
+  unresolved motif hump under-reports the blur. Canny thresholds relax (40/100 -> 20/50 -> 10/25) until >= 200
+  edge points exist, otherwise a heavily blurred photo has no edges to measure.
 """
 from __future__ import annotations
 
@@ -26,9 +29,10 @@ from scipy.optimize import least_squares
 from . import PX_PER_KNOT
 from .color import lab_to_rgb, rgb_to_lab
 from .job import MODELS_DIR, Job, JobError, dump_json
-from .metrics import guided
+from .metrics import canny_from_gradients, guided, lab_gradients
 
 SAM_PROMPTS = ("carpet", "rug", "carpet on the floor")
+PLATEAU_KNOTS = 1.5   # a resolved edge keeps a flat plateau this long on both sides (edge_width_px)
 
 
 # ----------------------------------------------------------------------------- SAM 3.1 wrapper
@@ -39,8 +43,9 @@ def sam_segment(photo_rgb: np.ndarray, prompts=SAM_PROMPTS, min_score: float = 0
     Raises JobError("sam_unavailable") when the package or the checkpoint is missing or inference fails.
     """
     ckpt_dir = MODELS_DIR / "sam3.1"
-    if not ckpt_dir.exists():
-        raise JobError("sam_unavailable", f"checkpoint dir missing: {ckpt_dir}")
+    ckpts = sorted(ckpt_dir.glob("*.pt")) if ckpt_dir.exists() else []
+    if not ckpts:
+        raise JobError("sam_unavailable", f"no checkpoint (*.pt) in {ckpt_dir}")
     try:
         import torch  # noqa: F401
         from sam3.model_builder import build_sam3_image_model  # type: ignore
@@ -48,7 +53,7 @@ def sam_segment(photo_rgb: np.ndarray, prompts=SAM_PROMPTS, min_score: float = 0
     except Exception as e:  # pragma: no cover - needs the real package
         raise JobError("sam_unavailable", f"sam3 import failed: {e}")
     try:  # pragma: no cover - needs weights + GPU
-        model = build_sam3_image_model(checkpoint_path=str(next(ckpt_dir.glob("*.pt"))))
+        model = build_sam3_image_model(checkpoint_path=str(ckpts[0]))
         proc = Sam3Processor(model)
         from PIL import Image
         state = proc.set_image(Image.fromarray(photo_rgb))
@@ -323,58 +328,70 @@ def contrast_image(rgb: np.ndarray, clip: float = 2.0, tile: int = 8) -> np.ndar
 def edge_width_px(rgb: np.ndarray, max_samples: int = 4000, noise_tol: float = 0.75, min_resolved: int = 20) -> float:
     """Median 10%-90% transition width (px) along the gradient direction at Canny edge points.
 
-    Each profile is oriented to rise through its centre and only the monotone run containing the
-    centre sample is measured (a neighbouring edge or the pile ripple ends the run). A run counts only
-    when both ends reach a plateau (>= 2 samples within 10 % of the range): an unresolved small motif
-    is a hump without plateaus and would report motif size, not blur. The statistic is the 25th
-    percentile (spec: median) because every contamination widens a profile and none narrows it.
+    Edges are colour edges: Canny runs on the Lab gradient (per pixel the channel with the strongest
+    gradient, OpenCV's multi-channel rule) so that two colours of equal lightness (a common two-colour
+    rug) still have measurable edges instead of only pile ripple. Each profile is the Lab profile
+    projected onto the local colour-change direction, oriented to rise through its centre; only the
+    monotone run containing the centre sample is measured (a neighbouring edge or the pile ripple
+    ends the run). A run counts only when both ends reach a plateau (>= 2 samples within 10 % of the
+    range and >= PLATEAU_KNOTS long): an unresolved small motif is a hump whose rise stops early
+    and would report a width *narrower* than the blur. The statistic is the median of the resolved
+    runs (spec: median).
     """
-    L = rgb_to_lab(rgb)[..., 0].astype(np.float32)
-    L8 = np.clip(L * 2.55, 0, 255).astype(np.uint8)
-    blurred = cv2.GaussianBlur(L8, (3, 3), 0)
+    # gradients of the lightly smoothed image for edge detection; profiles are sampled from `lab`
+    lab, gx3, gy3 = lab_gradients(rgb)
+    H, W = lab.shape[:2]
     # a heavily blurred photo has no edge above the default Canny thresholds: relax them until a
     # few hundred edge points exist (their width is what tells the blur)
+    ys = xs = np.zeros(0, np.int64)
     for lo_t, hi_t in ((40, 100), (20, 50), (10, 25)):
-        edges = cv2.Canny(blurred, lo_t, hi_t)
-        ys, xs = np.nonzero(edges)
+        ys, xs = np.nonzero(canny_from_gradients(gx3, gy3, lo_t, hi_t))
         if len(ys) >= 200:
             break
     if len(ys) == 0:
         return 1.0
-    gx = cv2.Sobel(L, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
-    # a diagonal edge is a knot staircase whose profile is wider than the optical blur: measure on
-    # axis-aligned edges (gradient within ~15 degrees of an axis) when there are enough of them
-    ga = np.stack([gx[ys, xs], gy[ys, xs]], axis=1)
-    na = np.linalg.norm(ga, axis=1) + 1e-6
-    axis = (np.abs(ga[:, 0]) / na > 0.966) | (np.abs(ga[:, 1]) / na > 0.966)
-    if axis.sum() >= max(50, 0.05 * len(ys)):
-        ys, xs = ys[axis], xs[axis]
-    rng = np.random.RandomState(0)
-    if len(ys) > max_samples:
-        sel = rng.choice(len(ys), max_samples, replace=False)
-        ys, xs = ys[sel], xs[sel]
-    H, W = L.shape
-    r = 6 * PX_PER_KNOT   # +-6 knots: wide enough for a pile_blur transition (> 2 knots)
-    ts = np.arange(-r, r + 1, dtype=np.float32)
-    g = np.stack([gx[ys, xs], gy[ys, xs]], axis=1).astype(np.float32)
+    # spatial gradient direction: the channel with the strongest gradient at the edge point
+    gxe, gye = gx3[ys, xs], gy3[ys, xs]                       # (N, 3)
+    mag = np.hypot(gxe, gye)
+    ch = np.argmax(mag, axis=1)
+    g = np.stack([gxe[np.arange(len(ys)), ch], gye[np.arange(len(ys)), ch]], axis=1)
     n = np.linalg.norm(g, axis=1)
     ok = n > 1e-3
     if not ok.any():
         return 1.0
-    d = g[ok] / n[ok, None]
-    px = xs[ok, None].astype(np.float32) + ts[None, :] * d[:, 0:1]
-    py = ys[ok, None].astype(np.float32) + ts[None, :] * d[:, 1:2]
+    ys, xs, g, n = ys[ok], xs[ok], g[ok], n[ok]
+    d = g / n[:, None]
+    gxe, gye = gxe[ok], gye[ok]
+    # a diagonal edge is a knot staircase whose profile is wider than the optical blur: measure on
+    # axis-aligned edges (gradient within ~15 degrees of an axis) when there are enough of them
+    axis = (np.abs(d[:, 0]) > 0.966) | (np.abs(d[:, 1]) > 0.966)
+    if axis.sum() >= max(50, 0.05 * len(ys)):
+        ys, xs, d, gxe, gye = ys[axis], xs[axis], d[axis], gxe[axis], gye[axis]
+    rng = np.random.RandomState(0)
+    if len(ys) > max_samples:
+        sel = np.sort(rng.choice(len(ys), max_samples, replace=False))
+        ys, xs, d, gxe, gye = ys[sel], xs[sel], d[sel], gxe[sel], gye[sel]
+    # colour-change direction u (unit Lab vector): the directional derivative of Lab along d
+    u = gxe * d[:, 0:1] + gye * d[:, 1:2]                     # (N, 3)
+    u = u / (np.linalg.norm(u, axis=1, keepdims=True) + 1e-6)
+    r = 6 * PX_PER_KNOT   # +-6 knots: wide enough for a pile_blur transition (> 2 knots)
+    ts = np.arange(-r, r + 1, dtype=np.float32)
+    px = xs[:, None].astype(np.float32) + ts[None, :] * d[:, 0:1]
+    py = ys[:, None].astype(np.float32) + ts[None, :] * d[:, 1:2]
     inside = (px.min(1) >= 0) & (py.min(1) >= 0) & (px.max(1) <= W - 1) & (py.max(1) <= H - 1)
     if not inside.any():
         return 1.0
-    prof = cv2.remap(L, px[inside], py[inside], cv2.INTER_LINEAR)  # (N, 2r+1), sampled along +gradient
+    px, py, u = px[inside], py[inside], u[inside]
+    prof = np.zeros(px.shape, np.float32)                     # (N, 2r+1), sampled along +gradient
+    for c in range(3):
+        prof += cv2.remap(np.ascontiguousarray(lab[..., c]), px, py, cv2.INTER_LINEAR) * u[:, c:c + 1]
     # light smoothing along the profile (sigma 1 px) so that camera / JPEG noise does not end the
     # monotone run early on a blurred edge; its own width is removed in quadrature below
     prof = cv2.GaussianBlur(prof, (5, 1), 1.0)
     n_s = prof.shape[1]
     c = n_s // 2
     widths, resolved = [], []
+    need = max(2, int(round(PLATEAU_KNOTS * PX_PER_KNOT)))
     for row in prof:
         # monotone (non-decreasing, noise_tol allowance) run through the centre
         l = c
@@ -395,14 +412,14 @@ def edge_width_px(rgb: np.ndarray, max_samples: int = 4000, noise_tol: float = 0
         tb = ib - 1 + (b - seg[ib - 1]) / max(1e-6, seg[ib] - seg[ib - 1]) if ib > 0 else 0.0
         w = max(0.5, float(tb - ta))
         widths.append(w)
-        if (seg <= a).sum() >= 2 and (seg >= b).sum() >= 2:
+        # a resolved step keeps a plateau of >= PLATEAU_KNOTS on both sides; the top of a Gaussian
+        # hump (an unresolved motif) stays within 10 % of its peak for only ~0.9 sigma
+        if (seg <= a).sum() >= need and (seg >= b).sum() >= need:
             resolved.append(w)
-    # blur bounds every width from below and contamination (motif humps, neighbouring edges, slow
-    # ramps) only widens: the 25th percentile is the robust blur estimate
     if len(resolved) >= min_resolved:
-        w = float(np.percentile(resolved, 25))
+        w = float(np.median(resolved))
     else:
-        w = float(np.percentile(widths, 25)) if widths else 1.0
+        w = float(np.median(widths)) if widths else 1.0
     # remove the profile smoothing (10-90 % width of a sigma-1 Gaussian = 2.56 px) in quadrature
     return float(max(1.0, np.sqrt(max(0.0, w * w - 2.56 ** 2))))
 

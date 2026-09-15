@@ -110,23 +110,45 @@ replaces it with its inner neighbour ring. Measurements that sit near the gradie
 
 ## Status (2026-09-15, uncommitted work in the tree)
 
-Session baseline was 27 failing tests of ≈ 136; the last full run had 6. The final batch of edits
-(adaptive Canny + p25 in `edge_width_px`, sigma-clipped illumination fit, broad-zone rule in the gradient
-mask, first-peak border period, original-contour vertices and the arc-vs-polyline rule in `regularize`)
-has **not** been verified by a full `pytest` run. Known open items:
+Full `pytest` on this laptop (Iris Xe, no CUDA) takes ≈ 6 min. Last complete run (before the final two
+structure edits): 137 tests, 2 failing. The final run after those edits was started and interrupted by
+the user, so the state below is partly unverified:
 
-- `tests/test_regularize.py`: `test_arc_fit_residual` and `test_jagged_diagonal_becomes_clean_stairs`
-  broke with the last regularize change. Cause found: on a rasterised circle the arc rms (≈ 0.13) is not
-  ≤ 0.5 × the DP-polyline rms (≈ 0.10–0.13), so no arc is ever accepted; use "arc rms ≤ polyline rms and
-  sagitta > tol" (spec: equal residuals → line) instead of the 0.5 factor. Diamonds still stay diamonds
-  because their polyline rms is ≈ 0. The diagonal test needs the same re-check after that.
-- `tests/test_structure.py::test_thin_line_frac_and_edit_routing`: measured `thin_line_frac` (0.070) vs
-  meta (0.097). The loss is diagonal lines that touch each other or a border motif in the coarse label
-  map and merge into one non-thin component; not yet solved.
-- `tests/test_structure.py::test_pile_blur_blocks_distressed` and the edit identity test
-  (`test_identity_backend_passes_and_stops_first_round`) were fixed in the last batch but not re-run.
+- Fixed and verified (targeted runs): `edge_width_px` (colour Canny on Lab gradients, median over
+  resolved profiles with ≥ 1.5-knot plateaus; the earlier p25 was dropped), `regularize` (arc rule
+  "circle rms ≤ tol, ≥ 8 knots, sagitta > tol, not a line within tol"; locked lines through the run's
+  centroid, vertices at line intersections — the fg and bg contour of one boundary now resolve to the
+  same line), `thin_line_frac` (thin residue of non-thin components after a 2×2 opening),
+  `noise_stats` (whole-map denominator), palette merging (drifting duplicates, transition-mix folding,
+  soft-boundary shading merge with `SHADE_DE` = 8, motif protection only across different colours and
+  only for components above the noise scale), edit loop `palette_deltaE_p95` (per-knot excess over the
+  photo, see `agents/loop.py` deviations), `test_edit.py::test_added_block…` (block colour changed to a
+  palette colour: a foreign colour quantises to the ground and reads as *missing*, not *added*).
+- Gradient mask: σ = 2 then σ = 4 passes, 16-knot blocks, edge-free zones, endpoint-ΔE rule and the
+  single-knot-dot dither test (`GRADIENT_MIN_DITHER`) — verified only on the diagnostic fixtures
+  (`geometric` seed 3 has no false corner regions, `gradient` seeds 62/71 keep their mask, the
+  two-colour `minimal` seed 141 has none). `test_flat_gradient_is_gradient_not_pictorial` passed in the
+  diagnostic, **not re-run under pytest**. The `class_mixed` and `gradient_mask_iou` tests were green in
+  the last complete run but predate the dot rule: re-run `tests/test_structure.py` first.
+- `test_class_detection_pure_templates`: 3 of 4 (the hv-symmetric `geometric` lattice is `classic` by
+  rule order; tolerated by the test).
+- New stage params in `STAGE_PARAM_KEYS`: `gradient_min_dither` (structure), `noise_cc_max` (palette).
 - Spec-listed tests still missing: `tests/test_design.py`, `tests/test_prepare.py`, `tests/test_tools.py`;
   `eval/synth_modern_ids.txt` is not generated (`generate_designs.py --n 100 --ids-file`, ≈ 2 s/design).
 - Two test expectations were corrected to the spec's rule rather than the fixture number
   (`test_calibrate.py`: null-share feature drop and the precision-based `qc_accept`; `test_edit.py`:
   tiling only when the single pass is below `edit_px_per_knot_target`).
+
+Models and environment (`models/` is gitignored):
+
+- `.venv` now has CPU torch 2.14 + torchvision, `huggingface_hub` (`.venv/bin/hf`), and the `sam3`
+  GitHub package installed with `--no-deps` (it pins `numpy<2`; the venv is numpy 2 / Python 3.14) plus
+  timm, ftfy, iopath, regex, einops, pycocotools, psutil, triton. It imports; inference is untested.
+- `models/sam3.1/`: not downloaded — `facebook/sam3.1` is gated. Accept the terms on Hugging Face, then
+  `.venv/bin/hf auth login` and `.venv/bin/hf download facebook/sam3.1 --local-dir models/sam3.1`
+  (3.5 GB, `sam3.1_multiplex.pt`). Until then every job needs `--corners`.
+- `models/qwen_image_edit_2511/`: a partial `hf download Qwen/Qwen-Image-Edit-2511` (≈ 17 of 57.7 GB)
+  stopped on request; `hf download` resumes it. `setup-check` reports the backend missing until
+  `model_index.json`, every shard and no `.incomplete` file are present. No GPU here anyway.
+- `knotvision_segment.pt` (training), `qc_calib.json` (designer scores) and Muse (`allow_api` + key)
+  are still missing; `cli.py setup-check` lists the gate each one triggers.
