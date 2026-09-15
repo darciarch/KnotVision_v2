@@ -53,7 +53,8 @@ def test_calibration_end_to_end():
     res = calibrate(rows, {"edit_gate_source": "assumed"})
     assert res["status"] == "ok", res
     assert res["target"] in (3, 4, 5) and res["cv_auc"] >= 0.75
-    assert len(res["features"]) == min(10, 150 // 15)
+    n_null = sum(1 for v in res["dropped_features"].values() if v == "null_share")
+    assert len(res["features"]) == min(10, 150 // 15) - n_null   # > 50 % null features leave the model
     assert "other" in res["class_levels"] and "classic" in res["class_levels"]
     assert res["mode_levels"] == ["segment", "quantize", "edit"]
     assert res["intra_rater_kappa"] is not None
@@ -87,7 +88,8 @@ def test_thresholds_rule():
     y = (prob > 0.6).astype(int)
     scores = np.where(prob < 0.3, 2, 4)
     acc, rej = thresholds(prob, y, scores)
-    assert acc >= 0.6 and rej <= acc and rej >= 0.25
+    # accept = lowest threshold whose selected set has precision >= 0.9 (just below the 0.6 label edge)
+    assert 0.5 <= acc <= 0.61 and rej <= acc and rej >= 0.25
 
 
 def test_capacity_medians_by_mode():

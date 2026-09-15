@@ -140,7 +140,7 @@ def run(job: Job) -> dict:
     inputs = [rg / "indexed.npy", st / "gradient_mask.npy", st / "gradient_regions.json", pd / "palette.json"]
     if (pr / "design_lab_smooth.npy").exists():
         inputs.append(pr / "design_lab_smooth.npy")
-    key = job.cache_key("dither", inputs, exclude_prefix="edit_")
+    key = job.cache_key("dither", inputs)
     if job.cached(sd, key) and (sd / "indexed.npy").exists():
         job.timings["dither"] = 0.0
         return job.state

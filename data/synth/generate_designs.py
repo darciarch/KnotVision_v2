@@ -318,23 +318,28 @@ def make_design(seed: int, dist: dict | None = None, template: str | None = None
         inner[:] = False
         inner[t:H - t, t:W - t] = True
     has_repeat = want("repeat", {"geometric": 0.8, "gradient": 0.2, "distressed": 0.3, "minimal": 0.0, "classic": 0.2}[template])
+    # a 4-connected 1-knot diagonal is a two-level staircase, so a `ring` motif and a 2-wide chevron
+    # stripe are thin lines by is_thin; an explicit thin_lines=False widens both
+    no_thin = feats.get("thin_lines") is False
     if has_repeat:
         p1 = int(rng.randint(10, max(11, min(H, W) // 4)))
         v1 = (0, p1)
         v2 = (p1, 0) if rng.uniform() < 0.6 else (p1, p1 // 2)
-        layout["repeat"] = paint_lattice(idx, rng, inner, v1, v2, nxt(), ground,
-                                         shape=str(rng.choice(["diamond", "square", "ring"])))
+        shape = str(rng.choice(["diamond", "square", "ring"]))   # one draw regardless of the flag (stable seeds)
+        if no_thin and shape == "ring":
+            shape = "diamond"
+        layout["repeat"] = paint_lattice(idx, rng, inner, v1, v2, nxt(), ground, shape=shape)
     if template == "geometric" and not has_repeat:
         # straight stripes / chevrons: lines locked to allowed slopes
         c = nxt()
         step = int(rng.randint(8, 16))
+        width = 3 if no_thin else 2
         for k in range(0, W + H, step):
             for s in range(min(H, W)):
                 y, x = s, k - s
-                if 0 <= x < W and 0 <= y < H and inner[y, x]:
-                    idx[y, x] = c
-                    if x + 1 < W and inner[y, x + 1]:
-                        idx[y, x + 1] = c
+                for w in range(width):
+                    if 0 <= x + w < W and 0 <= y < H and inner[y, x + w]:
+                        idx[y, x + w] = c
     if template == "classic" or (template != "minimal" and want("medallion", 0.15)):
         ry, rx = int(0.18 * H), int(0.22 * W)
         layout["medallion"] = paint_medallion(idx, rng, H // 2, W // 2, ry, rx, nxt(), nxt() if n >= 4 else None)
@@ -350,6 +355,7 @@ def make_design(seed: int, dist: dict | None = None, template: str | None = None
         n_grad = int(rng.randint(1, 4))
     elif want("gradient", 0.15):
         n_grad = 1
+    grad_masks = []
     for g in range(n_grad):
         ia, ib = (ground, nxt()) if g == 0 else (nxt(), nxt())
         if ia == ib:
@@ -371,6 +377,7 @@ def make_design(seed: int, dist: dict | None = None, template: str | None = None
         ys, xs = np.nonzero(region)
         info["bbox"] = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
         layout["gradient_regions"].append(info)
+        grad_masks.append(region)
         gmask |= region
     # --- noise
     noise_target = 0.0
@@ -404,8 +411,20 @@ def make_design(seed: int, dist: dict | None = None, template: str | None = None
     remap = {int(u): i for i, u in enumerate(used)}
     idx = np.vectorize(remap.get)(idx).astype(np.int32)
     pal = pal[used]
-    for r in layout["gradient_regions"]:
-        r["ia"], r["ib"] = remap[r["ia"]], remap[r["ib"]]
+    # a gradient region painted over later (noise, another region) has lost an endpoint: drop it and
+    # clear its mask so that meta / gradient_mask describe the final design, not the paint order
+    kept_regions, kept_masks = [], []
+    for r, m in zip(layout["gradient_regions"], grad_masks):
+        if sym != "none":
+            m = make_symmetric(m.astype(np.int32), sym).astype(bool)
+        if r["ia"] in remap and r["ib"] in remap and m.any() and (idx[m] == remap[r["ia"]]).any() and (idx[m] == remap[r["ib"]]).any():
+            r["ia"], r["ib"] = remap[r["ia"]], remap[r["ib"]]
+            kept_regions.append(r)
+            kept_masks.append(m)
+    layout["gradient_regions"] = kept_regions
+    gmask = np.zeros((H, W), dtype=bool)
+    for m in kept_masks:
+        gmask |= m
 
     gradient_frac = float(gmask.mean())
     noise_frac = float(nmask.mean())

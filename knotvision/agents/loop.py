@@ -106,6 +106,8 @@ def select_score(feats: dict, weights: dict) -> float:
 
 
 def violations(feats: dict, params: dict) -> list[str]:
+    """Stop criterion (spec 3g): the four edit_* thresholds. A candidate that passes all four ends
+    the loop."""
     v = []
     if feats["align_px"] > float(params.get("edit_align_max", 6.0)):
         v.append("align_px")
@@ -115,6 +117,12 @@ def violations(feats: dict, params: dict) -> list[str]:
         v.append("missing_pct")
     if feats["palette_deltaE_p95"] > float(params.get("edit_palette_deltaE_max", 8.0)):
         v.append("palette_deltaE_p95")
+    return v
+
+
+def feedback_violations(feats: dict, params: dict) -> list[str]:
+    """Feedback rules (spec 3h): the stop thresholds plus speckle and jaggedness hints."""
+    v = violations(feats, params)
     if feats["noise_1knot_pct"] > 0.05:
         v.append("noise_1knot_pct")
     if feats["line_jaggedness"] > 0.5:
@@ -199,7 +207,7 @@ def run_loop(backend: Backend, agent: dict, params: dict, edit_input: np.ndarray
         if not v or timeout:
             break
         if r < max_rounds - 1:
-            fb = PR.feedback(v, design_class)
+            fb = PR.feedback(feedback_violations(best[3], params), design_class)
             prompt = PR.round_prompt(prompt, fb)
             (out_dir / f"prompt_{r + 1}.txt").write_text(prompt)
             # next round edits the previous best candidate (in edit_input resolution)

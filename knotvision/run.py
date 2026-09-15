@@ -10,7 +10,7 @@ from typing import Optional
 from . import STAGES
 from . import intake, rectify, structure, palette, production, regularize, dither, qc, export
 from . import design_quant, design_seg, design_edit
-from .job import Job, JobError, dump_json
+from .job import Job, JobError, dump_json, edit_param_keys
 
 
 def run_design(job: Job) -> dict:
@@ -22,7 +22,7 @@ def run_design(job: Job) -> dict:
     inputs = [rect_png, pd / "palette.json", st / "gradient_mask.npy"]
     if mode == "edit":
         inputs.append(pd / "palette_card.png")
-    key = job.cache_key("design", inputs, extra={"mode": mode}, exclude_prefix=None if mode == "edit" else "edit_")
+    key = job.cache_key("design", inputs, extra={"mode": mode}, keys=edit_param_keys(job.params) if mode == "edit" else ())
     if job.cached(sd, key) and (sd / "design_rgb.png").exists():
         job.timings["design"] = 0.0
         return job.state

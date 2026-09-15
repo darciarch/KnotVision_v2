@@ -32,7 +32,7 @@ def ensure_baseline(job: Job, rect: np.ndarray, palette_lab: np.ndarray, out_dir
     """Baseline is keyed on rectified + palette only (not on edit_* params / agent)."""
     bdir = out_dir / "baseline"
     bdir.mkdir(parents=True, exist_ok=True)
-    key = job.cache_key("design_baseline", [rect_png, palette_json], exclude_prefix="edit_")
+    key = job.cache_key("design_baseline", [rect_png, palette_json])
     W, H = job.state["grid"]["W"], job.state["grid"]["H"]
     if job.cached(bdir, key) and (bdir / "ref_indexed.npy").exists():
         base = cv2.cvtColor(cv2.imread(str(bdir / "baseline_rgb.png"), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)

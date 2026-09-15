@@ -4,6 +4,13 @@ edge sharpness / effective resolution gates.
 
 Output: rectified.png (colour-correct), rectified_contrast.png (CLAHE L, for structure/edges only),
         mask.png, corners.json, job.json updated (grid, fringe, illumination, wb, warnings)
+
+Spec deviations:
+- the outermost knot ring of the rectified image is replaced by its inner neighbour ring: at the pile
+  edge the photo blends rug and background (blur, shadow), and that blend would otherwise become a
+  one-knot frame in the design and a spurious thin line / colour in every downstream measurement.
+- edge_width_knots is measured on axis-aligned edges when enough exist (a diagonal staircase is
+  wider than the optical blur) and with sub-sample 10 % / 90 % crossings.
 """
 from __future__ import annotations
 
@@ -278,6 +285,16 @@ def flatten_illumination(rgb: np.ndarray, deg: int = 2) -> tuple[np.ndarray, dic
         return rgb, {"range_L": 0.0, "residual": 0.0, "flattened": False}
     res = least_squares(lambda c: A @ c - b, x0=np.zeros(A.shape[1]), loss="huber", f_scale=0.1)
     coef = res.x
+    # a large dark (or light) region still bends the fit through Huber's linear tail: two rounds of
+    # sigma clipping keep the fit on the dominant tone (the illumination is what the majority shares)
+    for _ in range(2):
+        resid = A @ coef - b
+        mad = float(np.median(np.abs(resid - np.median(resid)))) * 1.4826 + 1e-6
+        keep = np.abs(resid) < 3.0 * mad
+        if keep.sum() < A.shape[1] * 3 or keep.all():
+            break
+        res = least_squares(lambda c: A[keep] @ c - b[keep], x0=coef, loss="huber", f_scale=0.1)
+        coef = res.x
     field = (_poly_terms(xn.ravel(), yn.ravel(), deg) @ coef).reshape(H, W)
     field = field - field.mean()  # preserve mean L
     L_flat = np.exp(logL - field)
@@ -303,16 +320,36 @@ def contrast_image(rgb: np.ndarray, clip: float = 2.0, tile: int = 8) -> np.ndar
     return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
 
-def edge_width_px(rgb: np.ndarray, max_samples: int = 4000) -> float:
-    """Median 10%-90% transition width (px) along the gradient direction at Canny edge points."""
+def edge_width_px(rgb: np.ndarray, max_samples: int = 4000, noise_tol: float = 0.75, min_resolved: int = 20) -> float:
+    """Median 10%-90% transition width (px) along the gradient direction at Canny edge points.
+
+    Each profile is oriented to rise through its centre and only the monotone run containing the
+    centre sample is measured (a neighbouring edge or the pile ripple ends the run). A run counts only
+    when both ends reach a plateau (>= 2 samples within 10 % of the range): an unresolved small motif
+    is a hump without plateaus and would report motif size, not blur. The statistic is the 25th
+    percentile (spec: median) because every contamination widens a profile and none narrows it.
+    """
     L = rgb_to_lab(rgb)[..., 0].astype(np.float32)
     L8 = np.clip(L * 2.55, 0, 255).astype(np.uint8)
-    edges = cv2.Canny(cv2.GaussianBlur(L8, (3, 3), 0), 40, 100)
-    ys, xs = np.nonzero(edges)
+    blurred = cv2.GaussianBlur(L8, (3, 3), 0)
+    # a heavily blurred photo has no edge above the default Canny thresholds: relax them until a
+    # few hundred edge points exist (their width is what tells the blur)
+    for lo_t, hi_t in ((40, 100), (20, 50), (10, 25)):
+        edges = cv2.Canny(blurred, lo_t, hi_t)
+        ys, xs = np.nonzero(edges)
+        if len(ys) >= 200:
+            break
     if len(ys) == 0:
         return 1.0
     gx = cv2.Sobel(L, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
+    # a diagonal edge is a knot staircase whose profile is wider than the optical blur: measure on
+    # axis-aligned edges (gradient within ~15 degrees of an axis) when there are enough of them
+    ga = np.stack([gx[ys, xs], gy[ys, xs]], axis=1)
+    na = np.linalg.norm(ga, axis=1) + 1e-6
+    axis = (np.abs(ga[:, 0]) / na > 0.966) | (np.abs(ga[:, 1]) / na > 0.966)
+    if axis.sum() >= max(50, 0.05 * len(ys)):
+        ys, xs = ys[axis], xs[axis]
     rng = np.random.RandomState(0)
     if len(ys) > max_samples:
         sel = rng.choice(len(ys), max_samples, replace=False)
@@ -331,36 +368,43 @@ def edge_width_px(rgb: np.ndarray, max_samples: int = 4000) -> float:
     inside = (px.min(1) >= 0) & (py.min(1) >= 0) & (px.max(1) <= W - 1) & (py.max(1) <= H - 1)
     if not inside.any():
         return 1.0
-    prof = cv2.remap(L, px[inside], py[inside], cv2.INTER_LINEAR)  # (N, 2r+1)
-    lo, hi = prof.min(1), prof.max(1)
-    keep = (hi - lo) >= 3
-    prof, lo, hi = prof[keep], lo[keep], hi[keep]
-    a = lo + 0.1 * (hi - lo)
-    b = lo + 0.9 * (hi - lo)
-    mid = (prof > a[:, None]) & (prof < b[:, None])
-    n_s = mid.shape[1]
+    prof = cv2.remap(L, px[inside], py[inside], cv2.INTER_LINEAR)  # (N, 2r+1), sampled along +gradient
+    # light smoothing along the profile (sigma 1 px) so that camera / JPEG noise does not end the
+    # monotone run early on a blurred edge; its own width is removed in quadrature below
+    prof = cv2.GaussianBlur(prof, (5, 1), 1.0)
+    n_s = prof.shape[1]
     c = n_s // 2
-    # width of the transition run that contains (or is nearest to) the centre sample
-    widths = np.zeros(len(mid), dtype=np.float32)
-    for i in range(len(mid)):
-        row = mid[i]
-        if not row.any():
-            widths[i] = 1.0
-            continue
-        if row[c]:
-            j = c
-        else:
-            nz = np.nonzero(row)[0]
-            j = int(nz[np.argmin(np.abs(nz - c))])
-        l = j
-        while l - 1 >= 0 and row[l - 1]:
+    widths, resolved = [], []
+    for row in prof:
+        # monotone (non-decreasing, noise_tol allowance) run through the centre
+        l = c
+        while l - 1 >= 0 and row[l - 1] <= row[l] + noise_tol:
             l -= 1
-        r_ = j
-        while r_ + 1 < n_s and row[r_ + 1]:
-            r_ += 1
-        widths[i] = float(r_ - l + 1)
-    widths = widths.tolist()
-    return float(np.median(widths)) if widths else 1.0
+        rr = c
+        while rr + 1 < n_s and row[rr + 1] >= row[rr] - noise_tol:
+            rr += 1
+        seg = row[l:rr + 1]
+        lo, hi = float(seg.min()), float(seg.max())
+        if hi - lo < 6.0:   # a real edge, not noise
+            continue
+        a, b = lo + 0.1 * (hi - lo), lo + 0.9 * (hi - lo)
+        # sub-sample crossings of the 10 % and 90 % levels (no +1 sample bias on sharp edges)
+        ia = int(np.argmax(seg >= a))
+        ib = int(np.argmax(seg >= b))
+        ta = ia - 1 + (a - seg[ia - 1]) / max(1e-6, seg[ia] - seg[ia - 1]) if ia > 0 else 0.0
+        tb = ib - 1 + (b - seg[ib - 1]) / max(1e-6, seg[ib] - seg[ib - 1]) if ib > 0 else 0.0
+        w = max(0.5, float(tb - ta))
+        widths.append(w)
+        if (seg <= a).sum() >= 2 and (seg >= b).sum() >= 2:
+            resolved.append(w)
+    # blur bounds every width from below and contamination (motif humps, neighbouring edges, slow
+    # ramps) only widens: the 25th percentile is the robust blur estimate
+    if len(resolved) >= min_resolved:
+        w = float(np.percentile(resolved, 25))
+    else:
+        w = float(np.percentile(widths, 25)) if widths else 1.0
+    # remove the profile smoothing (10-90 % width of a sigma-1 Gaussian = 2.56 px) in quadrature
+    return float(max(1.0, np.sqrt(max(0.0, w * w - 2.56 ** 2))))
 
 
 # ----------------------------------------------------------------------------- stage
@@ -475,6 +519,12 @@ def run(job: Job) -> dict:
     Hm = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
     interp = cv2.INTER_AREA if ppk >= PX_PER_KNOT else cv2.INTER_CUBIC
     rect = cv2.warpPerspective(photo, Hm, (PX_PER_KNOT * W, PX_PER_KNOT * H), flags=interp)
+    # outermost knot ring = pile edge blended with the background: take the inner neighbour ring
+    k = PX_PER_KNOT
+    rect[:k] = rect[k:2 * k]
+    rect[-k:] = rect[-2 * k:-k]
+    rect[:, :k] = rect[:, k:2 * k]
+    rect[:, -k:] = rect[:, -2 * k:-k]
     full = np.ones(rect.shape[:2], dtype=bool)
 
     # 10. white balance

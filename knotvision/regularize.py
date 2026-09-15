@@ -44,6 +44,8 @@ def _vote(stack: np.ndarray) -> np.ndarray:
 def _shift(a: np.ndarray, dy: int, dx: int, fill: int = -1) -> np.ndarray:
     out = np.full_like(a, fill)
     H, W = a.shape
+    if abs(dy) >= H or abs(dx) >= W:
+        return out
     ys = slice(max(0, dy), min(H, H + dy))
     xs = slice(max(0, dx), min(W, W + dx))
     out[ys, xs] = a[ys.start - dy:ys.stop - dy, xs.start - dx:xs.stop - dx]
@@ -157,9 +159,27 @@ def _free_run(orig: np.ndarray, tol: float) -> np.ndarray:
     return sm if dev <= tol else orig
 
 
+def _polyline_rms(contour: np.ndarray, idx: list, i: int, j: int) -> float:
+    """rms distance of contour[idx[i]:idx[j]] to the DP polyline through the vertices idx[i..j]."""
+    d2, n = 0.0, 0
+    for k in range(i, j):
+        pts = contour[idx[k]:idx[k + 1] + 1]
+        a, b = contour[idx[k]], contour[idx[k + 1]]
+        ab = b - a
+        L = float(np.hypot(*ab))
+        if L < 1e-9 or len(pts) == 0:
+            continue
+        rel = pts - a
+        d2 += float((((ab[0] * rel[:, 1] - ab[1] * rel[:, 0]) / L) ** 2).sum())
+        n += len(pts)
+    return float(np.sqrt(d2 / n)) if n else 0.0
+
+
 def _arc_run(contour: np.ndarray, idx: list, i: int, tol: float, min_pts: int = 8) -> tuple:
     """Longest run of DP vertices idx[i..j] (j >= i+3) whose contour points fit one circle with rms
-    residual <= tol and a sagitta > tol (otherwise a line describes them). (j, centre, r) or (None,)*3."""
+    residual <= tol, a sagitta > tol, and a residual at most half of the DP polyline's own residual
+    (a diamond or a stepped polygon is described by its lines: equal residuals -> line).
+    (j, centre, r) or (None,)*3."""
     best = (None, None, None)
     for j in range(i + 3, len(idx)):
         pts = contour[idx[i]:idx[j] + 1]
@@ -168,7 +188,8 @@ def _arc_run(contour: np.ndarray, idx: list, i: int, tol: float, min_pts: int = 
         c, r, res = _circle_fit(pts)
         chord = float(np.hypot(*(pts[-1] - pts[0])))
         sagitta = r - np.sqrt(max(0.0, r * r - (chord / 2) ** 2))
-        if res <= tol and 2.0 <= r < 1e4 and sagitta > tol:
+        poly = _polyline_rms(contour, idx, i, j)
+        if res <= tol and 2.0 <= r < 1e4 and sagitta > tol and res <= 0.5 * poly:
             best = (j, c, r)
         else:
             break
@@ -213,10 +234,17 @@ def regularize_contour(contour: np.ndarray, tol: float, min_line: int, free_runs
     3. greedy runs over DP vertices: the longest of {line run (LS rms <= tol), arc run (circle rms <=
     tol, sagitta > tol, >= 3 DP segments)} wins, a line on ties; a line run >= min_line is angle-locked;
     a run shorter than min_line is a free segment (run-length median, endpoints kept)."""
-    contour = _presmooth(np.asarray(contour, dtype=np.float64))
+    orig = np.asarray(contour, dtype=np.float64)
+    if len(orig) < 16:
+        # a motif this small is pixel art: every knot was placed by hand, nothing to regularise
+        return orig, {"line": 0.0, "arc": 0.0, "free": float(_length(orig))}
+    # the smoothed contour decides the segmentation (runs, classes); vertex positions and the points
+    # that are re-rasterised come from the original contour so that a convex corner (a diamond tip)
+    # is not pulled inward by the moving average
+    contour = _presmooth(orig)
     approx = approximate_polygon(contour, tolerance=tol)
     if len(approx) < 4:
-        return contour, {"line": 0.0, "arc": 0.0, "free": float(_length(contour))}
+        return orig, {"line": 0.0, "arc": 0.0, "free": float(_length(orig))}
     stats = {"line": 0.0, "arc": 0.0, "free": 0.0}
     idx = [int(np.argmin(np.hypot(*(contour - v).T))) for v in approx]
     for k in range(1, len(idx)):
@@ -224,14 +252,14 @@ def regularize_contour(contour: np.ndarray, tol: float, min_line: int, free_runs
             idx[k] = idx[k - 1] + 1
     idx = [min(i, len(contour) - 1) for i in idx]
     idx[-1] = len(contour) - 1
-    out = [contour[idx[0]].copy()]
+    out = [orig[idx[0]].copy()]
     i = 0
     while i < len(idx) - 1:
         jl = _line_run(contour, idx, i, tol)
         ja, c, r = _arc_run(contour, idx, i, tol)
-        pts = contour[idx[i]:idx[jl] + 1]
+        pts = orig[idx[i]:idx[jl] + 1]
         if ja is not None and ja > jl:
-            pts = contour[idx[i]:idx[ja] + 1]
+            pts = orig[idx[i]:idx[ja] + 1]
             ang = np.arctan2(pts[:, 0] - c[0], pts[:, 1] - c[1])
             snapped = np.column_stack([c[0] + r * np.sin(ang), c[1] + r * np.cos(ang)])
             snapped[0], snapped[-1] = out[-1], pts[-1]
@@ -351,7 +379,7 @@ def run(job: Job) -> dict:
     sd = job.stage_dir("regularize")
     pr, st = job.stage_dir("production"), job.stage_dir("structure")
     inputs = [pr / "indexed_raw.npy", st / "layout.json", st / "regions.npy", st / "gradient_mask.npy"]
-    key = job.cache_key("regularize", inputs, exclude_prefix="edit_")
+    key = job.cache_key("regularize", inputs)
     if job.cached(sd, key) and (sd / "indexed.npy").exists():
         job.timings["regularize"] = 0.0
         return job.state

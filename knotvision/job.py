@@ -36,6 +36,34 @@ LOOM_ONLY_FIELDS = ("allowed_machine_colors", "reed_per_m", "density_definition"
 # that is passed through verbatim under resolved_params["agent"].
 AGENT_OVERRIDE_PREFIX = "edit_"
 
+# Params each stage reads. Only these enter the stage's cache key, so a config change reruns exactly
+# the stages that consume it (spec: a class-file change reruns from structure on, an agent-file change
+# reruns design/edit only). A stage that starts reading a new param must add it here.
+STAGE_PARAM_KEYS = {
+    "intake": ("allowed_machine_colors", "reed_per_m", "density_definition", "photo_long_px_rec"),
+    "rectify": ("fringe_detect", "fringe_max_frac", "allow_partial", "planarity_warn", "planarity_stop",
+                "illum_poly_deg", "illum_warn", "photo_px_warn", "photo_px_stop", "pile_blur_knots", "allow_low_res"),
+    # design_mode / edit_thin_line_max are NOT here: routing is re-applied from layout.json on a cache hit
+    "structure": ("border_frac_min", "border_frac_max", "grad_min", "grad_max", "noise_cc_min", "noise_cc_max",
+                  "min_region_knots", "line_min_knots", "line_max_width", "edge_density_min", "gradient_class_frac",
+                  "noise_class_frac", "class_margin_min", "planarity_warn", "grid_mismatch_tol"),
+    "palette": ("area_weight_exp", "adjacency_penalty", "gain_stop_select", "merge_cost_stop",
+                "motif_color_min_cc", "motif_min_knots"),
+    "design_baseline": (),
+    "production": ("boundary_thr", "boundary_snap_r", "noise_cc_min", "noise_cc_max", "min_region_knots",
+                   "min_coverage_pct", "line_min_knots", "line_max_width", "motif_min_knots", "motif_color_min_cc",
+                   "palette_model_mismatch_warn", "deltaE_warn", "design_class"),
+    "regularize": ("regularize", "reg_tol_knots", "reg_min_line_knots", "reg_free_runs", "enforce_conf",
+                   "force_symmetry", "force_border_repeat", "force_ground_repeat", "min_region_knots",
+                   "line_min_knots", "line_max_width", "motif_min_knots", "guard_warn_pct", "design_class"),
+    "dither": ("dither", "dither_pattern", "dither_pattern_override", "dither_levels"),
+}
+
+
+def edit_param_keys(params: dict) -> tuple:
+    """Keys the edit design path reads: every edit_* field, the raw agent yaml and the class (prompt)."""
+    return tuple(sorted(k for k in params if k.startswith("edit_"))) + ("agent", "design_class")
+
 # Warnings that stop the job (hard stops) vs. warnings that become hard gates in qc.
 STOP_CODES = {
     "needs_corners", "sam_unavailable", "class_unsupported", "grid_input_mismatch",
@@ -354,6 +382,7 @@ class Job:
                 raise JobError("edit_agent_missing", "design_mode: edit requires edit_agent")
             agent_cfg = load_agent_config(name)
         self.params = resolve_params(self.profile, class_cfg, override, agent_cfg)
+        self.params["design_class"] = dc
         self.params["design_mode_requested"] = self.params.get("design_mode", "quantize")
         if self.params["design_mode"] not in DESIGN_MODES:
             raise JobError("bad_design_mode", str(self.params["design_mode"]))
@@ -381,7 +410,11 @@ class Job:
         return self.params.get("design_mode") == "edit"
 
     # ---- cache
-    def params_hash(self, exclude_prefix: Optional[str] = None) -> str:
+    def params_hash(self, keys: Optional[tuple] = None, exclude_prefix: Optional[str] = None) -> str:
+        """Hash of the params subset `keys` (missing keys hash as None). Without `keys`: every param
+        except those starting with `exclude_prefix` (legacy full-set hash)."""
+        if keys is not None:
+            return sha256_obj({k: self.params.get(k) for k in keys})
         p = {k: v for k, v in self.params.items()
              if not (exclude_prefix and k.startswith(exclude_prefix)) and k != "agent"}
         if exclude_prefix != "edit_" and self.params.get("agent"):
@@ -389,8 +422,12 @@ class Job:
         return sha256_obj(p)
 
     def cache_key(self, stage: str, inputs: list, extra: Optional[dict] = None,
-                  exclude_prefix: Optional[str] = None) -> str:
-        parts = {"stage": stage, "params": self.params_hash(exclude_prefix), "extra": extra or {},
+                  exclude_prefix: Optional[str] = None, keys: Optional[tuple] = None) -> str:
+        """Stage cache key: input file hashes + the params the stage reads (STAGE_PARAM_KEYS[stage]
+        unless `keys` is given) + `extra`."""
+        if keys is None:
+            keys = STAGE_PARAM_KEYS.get(stage)
+        parts = {"stage": stage, "params": self.params_hash(keys, exclude_prefix), "extra": extra or {},
                  "inputs": []}
         for x in inputs:
             x = Path(x)

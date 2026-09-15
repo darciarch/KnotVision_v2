@@ -8,7 +8,8 @@
    greedy cluster merge (cost = weighted deltaE increase + adjacency_penalty * shared/total; down to
    machine_colors then continue while cost < merge_cost_stop). Gradient endpoints are never merged.
 4. Motif-colour protection: clusters with small coverage but >= motif_color_min_cc components or a
-   largest component >= motif_min_knots are merged last.
+   largest component >= motif_min_knots are merged last. Protection is evaluated after k-means
+   duplicates (deltaE < DUP_DE) are merged, otherwise fragments of one flat colour look like motifs.
 5. palette.json, palette_proposed.json, palette_card.png
 Output: palette.json, palette_proposed.json, palette_card.png
 """
@@ -94,13 +95,28 @@ def cluster_photo(rect_rgb: np.ndarray, gmask_grid: Optional[np.ndarray], machin
 
 # ----------------------------------------------------------------------------- motif-colour protection
 
-def motif_protected(cl: dict, motif_color_min_cc: int, motif_min_knots: int, W: int, H: int) -> np.ndarray:
-    """Clusters whose coverage is small but that form >= motif_color_min_cc components or one
-    component >= motif_min_knots (measured on the 400 px label image, scaled to knots)."""
-    labels_img = cl["labels_img"]
+DUP_DE = 2.5   # clusters closer than this are the same yarn split by k-means; they merge before anything else
+
+
+def _group_label_image(cl: dict, groups: list[list[int]]) -> np.ndarray:
+    lut = np.full(len(cl["centers"]) + 1, -1, dtype=np.int32)
+    for gi, g in enumerate(groups):
+        for i in g:
+            lut[i] = gi
+    li = cl["labels_img"]
+    return np.where(li >= 0, lut[np.clip(li, 0, len(lut) - 1)], -1)
+
+
+def motif_protected(cl: dict, motif_color_min_cc: int, motif_min_knots: int, W: int, H: int,
+                    groups: Optional[list[list[int]]] = None) -> np.ndarray:
+    """Colours whose coverage is small but that form >= motif_color_min_cc components or one
+    component >= motif_min_knots (measured on the 400 px label image, scaled to knots). Evaluated per
+    cluster, or per group when `groups` is given (k-means fragments of one flat colour look like many
+    components; dedup first, then protect)."""
+    labels_img = cl["labels_img"] if groups is None else _group_label_image(cl, groups)
     h, w = labels_img.shape
     knots_per_px = (W * H) / float(h * w)
-    n = len(cl["centers"])
+    n = len(cl["centers"]) if groups is None else len(groups)
     prot = np.zeros(n, dtype=bool)
     total = labels_img.size
     for i in range(n):
@@ -121,54 +137,99 @@ def motif_protected(cl: dict, motif_color_min_cc: int, motif_min_knots: int, W: 
 
 # ----------------------------------------------------------------------------- selection paths
 
-def merge_clusters(cl: dict, machine_colors: int, adjacency_penalty: float, merge_cost_stop: float,
-                   protected: np.ndarray) -> list[list[int]]:
-    """Greedy merge; returns groups of original cluster ids. Cost = weighted deltaE increase +
-    adjacency_penalty * shared / total boundary. Forced (gradient endpoints) are never merged."""
-    centers, weights, adj, forced = cl["centers"], cl["weights"], cl["adj"], cl["forced"]
-    groups = [[i] for i in range(len(centers))]
-    gcent = [centers[i].copy() for i in range(len(centers))]
-    gw = [float(weights[i]) for i in range(len(centers))]
-    gforced = [bool(forced[i]) for i in range(len(centers))]
-    gprot = [bool(protected[i]) for i in range(len(centers))]
-    total_adj = adj.sum() / 2 + 1e-9
+class _Groups:
+    """Greedy agglomeration state over the original clusters (weighted Lab centres, forced flags)."""
 
-    def group_adj(ga, gb):
-        return sum(adj[i, j] for i in ga for j in gb)
+    def __init__(self, cl: dict, groups: Optional[list[list[int]]] = None):
+        centers, weights, forced = cl["centers"], cl["weights"], cl["forced"]
+        self.adj = cl["adj"]
+        self.total_adj = self.adj.sum() / 2 + 1e-9
+        self.groups = [list(g) for g in groups] if groups is not None else [[i] for i in range(len(centers))]
+        self.cent, self.w, self.forced = [], [], []
+        for g in self.groups:
+            f = [i for i in g if forced[i]]
+            wsum = float(sum(weights[i] for i in g))
+            if f:
+                self.cent.append(centers[f[0]].copy())
+            else:
+                self.cent.append(sum(centers[i] * weights[i] for i in g) / max(wsum, 1e-9))
+            self.w.append(wsum)
+            self.forced.append(bool(f))
 
-    while len(groups) > 1:
+    def shared(self, a: int, b: int) -> float:
+        return float(sum(self.adj[i, j] for i in self.groups[a] for j in self.groups[b]))
+
+    def merge(self, a: int, b: int):
+        if self.forced[b] and not self.forced[a]:
+            a, b = b, a
+        if not self.forced[a]:
+            self.cent[a] = (self.cent[a] * self.w[a] + self.cent[b] * self.w[b]) / (self.w[a] + self.w[b])
+        self.w[a] += self.w[b]
+        self.groups[a] = self.groups[a] + self.groups[b]
+        del self.groups[b], self.cent[b], self.w[b], self.forced[b]
+        return a, b
+
+
+def dedup_groups(cl: dict, dup_de: float = DUP_DE) -> list[list[int]]:
+    """Merge clusters that are the same colour (deltaE < dup_de). Two forced (gradient endpoint)
+    clusters never merge; a forced cluster may absorb a free duplicate and keeps its centre."""
+    G = _Groups(cl)
+    while len(G.groups) > 1:
         best = None
-        for a in range(len(groups)):
-            for b in range(a + 1, len(groups)):
-                if gforced[a] and gforced[b]:
+        for a in range(len(G.groups)):
+            for b in range(a + 1, len(G.groups)):
+                if G.forced[a] and G.forced[b]:
                     continue
-                if gforced[a] or gforced[b]:
-                    # a forced endpoint may absorb a free cluster only if very close
-                    de = float(delta_e2000(gcent[a], gcent[b]))
-                    if de > 2.0:
-                        continue
-                de = float(delta_e2000(gcent[a], gcent[b]))
-                wa, wb = gw[a], gw[b]
-                cost = de * min(wa, wb) / (wa + wb) + adjacency_penalty * group_adj(groups[a], groups[b]) / total_adj
-                if gprot[a] or gprot[b]:
-                    cost += 1e3  # protected clusters are merged last
+                de = float(delta_e2000(G.cent[a], G.cent[b]))
+                if de < dup_de and (best is None or de < best[0]):
+                    best = (de, a, b)
+        if best is None:
+            break
+        G.merge(best[1], best[2])
+    return G.groups
+
+
+def merge_clusters(cl: dict, machine_colors: int, adjacency_penalty: float, merge_cost_stop: float,
+                   protected: Optional[np.ndarray] = None, groups: Optional[list[list[int]]] = None) -> list[list[int]]:
+    """Greedy merge; returns groups of original cluster ids.
+
+    Duplicates (deltaE < DUP_DE) merge first at no cost. Then cost = weighted deltaE increase +
+    adjacency_penalty * shared / total boundary; merging continues down to machine_colors and after
+    that while the cost stays below merge_cost_stop. Forced (gradient endpoints) never merge with each
+    other. Protected (motif) colours carry a +1e3 cost against a different colour, i.e. they merge last;
+    `protected` is per group when `groups` is given, else per cluster (a group is protected when every
+    member is)."""
+    if groups is None:
+        groups = dedup_groups(cl)
+        if protected is not None and len(protected) == len(cl["centers"]):
+            protected = np.array([all(bool(protected[i]) for i in g) for g in groups])
+    G = _Groups(cl, groups)
+    gprot = [bool(x) for x in protected] if protected is not None and len(protected) == len(groups) else [False] * len(groups)
+    while len(G.groups) > 1:
+        best = None
+        for a in range(len(G.groups)):
+            for b in range(a + 1, len(G.groups)):
+                if G.forced[a] and G.forced[b]:
+                    continue
+                de = float(delta_e2000(G.cent[a], G.cent[b]))
+                if (G.forced[a] or G.forced[b]) and de > DUP_DE:
+                    continue   # a forced endpoint may absorb a free cluster only if it is the same colour
+                wa, wb = G.w[a], G.w[b]
+                cost = de * min(wa, wb) / (wa + wb) + adjacency_penalty * G.shared(a, b) / G.total_adj
+                if (gprot[a] or gprot[b]) and de > DUP_DE:
+                    cost += 1e3
                 if best is None or cost < best[0]:
                     best = (cost, a, b)
         if best is None:
             break
         cost, a, b = best
-        if len(groups) <= machine_colors and cost >= merge_cost_stop:
+        if len(G.groups) <= machine_colors and cost >= merge_cost_stop:
             break
-        # merge b into a (weighted centre; forced centre wins)
-        if gforced[b] and not gforced[a]:
-            a, b = b, a
-        if not gforced[a]:
-            gcent[a] = (gcent[a] * gw[a] + gcent[b] * gw[b]) / (gw[a] + gw[b])
-        gw[a] += gw[b]
-        groups[a] = groups[a] + groups[b]
-        gprot[a] = gprot[a] and gprot[b]
-        del groups[b], gcent[b], gw[b], gforced[b], gprot[b]
-    return groups
+        pa, pb = gprot[a], gprot[b]
+        a, b = G.merge(a, b)
+        gprot[a] = pa and pb
+        del gprot[b]
+    return G.groups
 
 
 def select_from_library(cl: dict, yarn_lab: np.ndarray, yarns: list, machine_colors: int,
@@ -230,7 +291,8 @@ def run(job: Job) -> dict:
     idir = job.stage_dir("intake")
     if (idir / "yarn_lab.npy").exists():
         inputs.append(idir / "yarn_lab.npy")
-    key = job.cache_key("palette", inputs, extra={"override": job.palette_override}, exclude_prefix="edit_")
+    mc = int(job.machine_colors)
+    key = job.cache_key("palette", inputs, extra={"override": job.palette_override, "mc": mc})
     if job.cached(sd, key) and (sd / "palette.json").exists():
         job.timings["palette"] = 0.0
         return job.state
@@ -240,7 +302,6 @@ def run(job: Job) -> dict:
     rect = cv2.cvtColor(cv2.imread(str(rect_png), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
     gmask = np.load(st / "gradient_mask.npy")
     gregions = read_json(st / "gradient_regions.json")
-    mc = int(job.machine_colors)
 
     cl = cluster_photo(rect, gmask, mc, float(P.get("area_weight_exp", 0.5)), gregions)
     entries = []
@@ -264,8 +325,9 @@ def run(job: Job) -> dict:
                             "yarn_code": yarns[j]["yarn_code"], "name": yarns[j]["name"], "gradient_endpoint": ep})
         source = "library"
     else:
-        prot = motif_protected(cl, int(P.get("motif_color_min_cc", 5)), int(P.get("motif_min_knots", 10)), W, H)
-        groups = merge_clusters(cl, mc, float(P.get("adjacency_penalty", 2.0)), float(P.get("merge_cost_stop", 0.5)), prot)
+        groups0 = dedup_groups(cl)
+        prot = motif_protected(cl, int(P.get("motif_color_min_cc", 5)), int(P.get("motif_min_knots", 10)), W, H, groups=groups0)
+        groups = merge_clusters(cl, mc, float(P.get("adjacency_penalty", 2.0)), float(P.get("merge_cost_stop", 0.5)), prot, groups=groups0)
         # order: coverage descending, lowest original id on ties
         def cov(g):
             return float(sum(cl["counts"][i] for i in g))

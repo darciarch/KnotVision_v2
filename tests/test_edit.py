@@ -16,7 +16,9 @@ def _edit_job(pair, tmp_root, agent, job_id, **kw):
 
 def test_working_resolution_and_tiling():
     P = {"edit_px_per_knot_target": 2.0, "edit_px_per_knot_min": 1.0, "edit_tiling": "auto", "edit_tile_px": 1024}
-    wr = working_resolution(400, 600, P, 1536)
+    wr0 = working_resolution(400, 600, P, 1536)
+    assert not wr0["tiled"] and wr0["px_per_knot"] == 2.0          # 1200 px long side fits a single pass
+    wr = working_resolution(400, 1000, P, 1536)                     # single pass would be 1.536 px/knot
     assert wr["tiled"] and wr["px_per_knot"] == 2.0 and wr["n_tiles"] > 1 and wr["w"] % 16 == 0 and wr["h"] % 16 == 0
     wr2 = working_resolution(400, 1000, {**P, "edit_tiling": "off"}, 1536)
     assert not wr2["tiled"] and wr2["px_per_knot"] < 2.0 and not wr2["low_res"]

@@ -4,6 +4,15 @@ ground repeat / knot grid field), TPS correction, region map.
 
 Output: layout.json, regions.npy, coarse_labels.npy, gradient_mask.npy, gradient_regions.json,
         rectified*.png (rewritten only if TPS applied), job.json (resolved_params, final design_mode)
+
+Spec deviations (scale invariance; see CLAUDE.md "Scale: measure in knots"):
+- class-feature `edge_density` and `line_frac` are measured on the coarse label map at grid resolution
+  (boundaries of components >= EDGE_MIN_COMPONENT knots, outside the gradient mask) instead of the
+  512 px Canny map, so that knot-scale texture (dither, speckle) is not counted as edges. The 512 px
+  Canny map is still used for the layout (medallion) only.
+- the gradient-mask block test works on Lab smoothed at sigma = 2 knots (plane fit + edge test) and
+  sigma = 8 knots (direction coherence); a plane must explain >= 0.6 of the sigma-2 variance.
+- `thin_line_frac` excludes the gradient mask (a dither checkerboard is not a drawn line).
 """
 from __future__ import annotations
 
@@ -19,11 +28,13 @@ from sklearn.cluster import KMeans
 from . import DESIGN_CLASSES, PX_PER_KNOT
 from .color import delta_e2000, rgb_to_lab
 from .job import Job, dump_json, read_json
-from .metrics import canny_L, component_area_map, connected_components, is_thin, noise_stats
+from .metrics import boundary_map, canny_L, component_area_map, connected_components, is_thin, noise_stats
 
 DETECT_CONF = 0.6          # detection threshold for symmetry / period / repeat / medallion
-GRAD_MIN_DEFAULT = 0.04    # L per knot, gradient mask lower bound
-GRAD_MAX_DEFAULT = 1.5     # L per knot, upper bound (above this it is an edge, not a ramp)
+GRAD_MIN_DEFAULT = 0.1     # Lab units per knot: a ramp must span >= 3.2 units over a 32-knot block
+GRAD_MAX_DEFAULT = 5.0     # Lab units per knot, upper bound (a step edge smoothed at sigma 2 is steeper)
+EDGE_L_PER_KNOT = 3.0      # |grad L| on the sigma-2-knot image above this is a step edge
+EDGE_MIN_COMPONENT = 8     # knots; boundaries of smaller components are texture, not edges
 REGION_GROUND, REGION_BORDER, REGION_MEDALLION, REGION_OTHER, REGION_CORNER = 0, 1, 2, 3, 4
 
 
@@ -59,45 +70,42 @@ def detect_symmetry(L: np.ndarray) -> dict:
 
 # ----------------------------------------------------------------------------- 2./3. border
 
-def _edge_profile(lab: np.ndarray, edge: str) -> np.ndarray:
-    """Per-row (top/bottom) or per-column (left/right) signal from the edge inward:
-    [mean L, mean a, mean b, std L]."""
-    if edge in ("top", "bottom"):
-        m = lab.mean(axis=1)
-        s = lab[..., 0].std(axis=1)
-    else:
-        m = lab.mean(axis=0)
-        s = lab[..., 0].std(axis=0)
-    sig = np.concatenate([m, s[:, None]], axis=1)
-    if edge in ("bottom", "right"):
-        sig = sig[::-1]
-    return sig
+def _share_vectors(labels: np.ndarray, k: int) -> np.ndarray:
+    """Per-row label share (rows x k)."""
+    H, W = labels.shape
+    out = np.zeros((H, k), np.float64)
+    for i in range(H):
+        out[i] = np.bincount(labels[i], minlength=k) / W
+    return out
 
 
-def _best_change(sig: np.ndarray, lo: int, hi: int) -> tuple[Optional[int], float]:
-    """Largest mean shift between sig[0:t] and sig[t:2t] for t in [lo, hi]. Returns (t, score)."""
-    best_t, best = None, 0.0
-    n = len(sig)
-    for t in range(lo, min(hi, n // 2) + 1):
-        a = sig[:t].mean(0)
-        b = sig[t:2 * t].mean(0)
-        within = sig[:t].std(0).mean() + sig[t:2 * t].std(0).mean() + 1e-6
-        score = np.linalg.norm(a - b) / within
-        if score > best:
-            best, best_t = score, t
-    return best_t, float(best)
-
-
-def detect_border(lab512: np.ndarray, frac_min: float, frac_max: float) -> dict:
-    h, w = lab512.shape[:2]
-    short = min(h, w)
+def detect_border(labels: np.ndarray, frac_min: float, frac_max: float, px512_per_knot: float) -> dict:
+    """Border thickness per edge from the coarse label map: the inward depth t at which the label
+    composition of the strip [0, t) differs most from the strip [t, 2t) (half the L1 distance of the
+    two share vectors, in [0, 1]). A motif row inside the border or a lattice on the ground shifts the
+    composition far less than the border/ground colour change itself, so the maximum sits on the
+    inner border edge. Thicknesses are reported in 512-px units (`thickness_px`) for the layout."""
+    H, W = labels.shape
+    k = int(labels.max()) + 1
+    short = min(H, W)
     out = {}
     for edge in ("top", "bottom", "left", "right"):
-        sig = _edge_profile(lab512, edge)
-        lo = max(3, int(short * frac_min))
-        hi = max(lo, int(short * frac_max))
-        t, score = _best_change(sig, lo, hi)
-        out[edge] = {"thickness_px": t, "score": score, "detected": bool(t is not None and score >= 1.5)}
+        arr = labels if edge in ("top", "bottom") else labels.T
+        if edge in ("bottom", "right"):
+            arr = arr[::-1]
+        sv = _share_vectors(arr, k)
+        cum = np.cumsum(sv, axis=0)
+        lo = max(2, int(round(short * frac_min)))
+        hi = max(lo, min(int(short * frac_max), arr.shape[0] // 2 - 1))
+        best_t, best = None, 0.0
+        for t in range(lo, hi + 1):
+            a = cum[t - 1] / t
+            b = (cum[2 * t - 1] - cum[t - 1]) / t
+            score = 0.5 * float(np.abs(a - b).sum())
+            if score > best:
+                best, best_t = score, t
+        out[edge] = {"thickness_knots": best_t, "thickness_px": None if best_t is None else int(round(best_t * px512_per_knot)),
+                     "score": best, "detected": bool(best_t is not None and best >= DETECT_CONF)}
     return out
 
 
@@ -130,12 +138,18 @@ def border_period(L512: np.ndarray, border: dict, min_period: int = 6) -> dict:
         sig = s.mean(axis=0)
         ac = _autocorr_1d(sig)
         n = len(ac)
-        rng = ac[min_period:n // 2]
-        if len(rng) == 0:
+        if n // 2 <= min_period + 1:
             res[e] = {"period_px": None, "conf": 0.0}
             continue
-        # first local maximum above threshold
-        k = int(np.argmax(rng)) + min_period
+        # the fundamental: first local maximum >= DETECT_CONF (harmonics come later and, with the
+        # overlap-bias correction, can be higher); fallback: the global maximum
+        k = None
+        for j in range(min_period, n // 2 - 1):
+            if ac[j] >= DETECT_CONF and ac[j] > ac[j - 1] and ac[j] >= ac[j + 1]:
+                k = j
+                break
+        if k is None:
+            k = int(np.argmax(ac[min_period:n // 2])) + min_period
         conf = float(ac[k])
         res[e] = {"period_px": int(k) if conf >= DETECT_CONF else None, "conf": conf}
     return res
@@ -231,88 +245,153 @@ def lattice_nodes(v1, v2, H, W, origin=(0, 0)) -> np.ndarray:
 
 # ----------------------------------------------------------------------------- 5b. gradient mask
 
+def _nconv(field: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
+    """Normalised Gaussian convolution: smooth `field` using only `valid` cells."""
+    v = valid.astype(np.float32)
+    num = cv2.GaussianBlur(field * v, (0, 0), sigma)
+    den = cv2.GaussianBlur(v, (0, 0), sigma)
+    return np.where(den > 0.05, num / np.maximum(den, 1e-6), field)
+
+
 def gradient_mask(rect_rgb: np.ndarray, W: int, H: int, grad_min: float, grad_max: float,
-                  block_knots: int = 32, edge_density_max: float = 0.02) -> tuple[np.ndarray, list]:
-    """Blocks of 32x32 knots with low edge density AND a low-frequency (σ = 8 knots) one-directional
-    ramp (|∇L| in [grad_min, grad_max] L/knot, direction consistency >= 0.8). Blocks are merged,
-    closed with an 8-knot element, regions < 64 knots dropped. Returns (mask (H, W) bool, regions)."""
+                  block_knots: int = 32, edge_density_max: float = 0.02, band_knots: int = 2,
+                  debug: Optional[list] = None) -> tuple[np.ndarray, list]:
+    """Blocks of 32x32 knots with low edge density AND a one-directional low-frequency ramp.
+
+    Per block, on Lab at grid resolution smoothed with sigma = 2 knots (dither / speckle / pile ripple
+    suppressed, motif structure kept): edge share <= edge_density_max (|grad L| > EDGE_L_PER_KNOT),
+    a plane fit per Lab channel whose combined slope lies in [grad_min, grad_max] units/knot and that
+    explains >= 0.6 of the dominant channel's variance, and direction coherence >= 0.8 of the
+    sigma = 8 knot gradient field. Blocks are merged, closed with an 8-knot element, regions < 64 knots
+    dropped. Returns (mask (H, W) bool, regions [{id, area_knots, direction, lab_lo, lab_hi, bbox}])."""
     lab = rgb_to_lab(rect_rgb)
-    # to grid resolution
-    Lg = cv2.resize(lab[..., 0].astype(np.float32), (W, H), interpolation=cv2.INTER_AREA)
-    ag = cv2.resize(lab[..., 1].astype(np.float32), (W, H), interpolation=cv2.INTER_AREA)
-    bg = cv2.resize(lab[..., 2].astype(np.float32), (W, H), interpolation=cv2.INTER_AREA)
-    # dither texture (1-knot checkers) must not count as edges: 1-knot blur before Canny
-    soft = cv2.GaussianBlur(rect_rgb, (0, 0), float(PX_PER_KNOT))
-    edges = cv2.resize(canny_L(soft).astype(np.float32), (W, H), interpolation=cv2.INTER_AREA)
-    # a step edge smoothed with sigma = 8 knots looks like a ramp; exclude a 3-knot band around edges
-    # and smooth with a normalised convolution so that only genuinely smooth areas contribute
-    edge_band = cv2.dilate((edges > 0).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
-    valid = (~edge_band).astype(np.float32)
-    def _nconv(sig):
-        num = cv2.GaussianBlur(Lg * valid, (0, 0), sig)
-        den = cv2.GaussianBlur(valid, (0, 0), sig)
-        return np.where(den > 0.05, num / np.maximum(den, 1e-6), Lg)
-    Ls = _nconv(8)    # ramp direction / magnitude / plane fit (dither steps averaged out)
-    gx = cv2.Sobel(Ls, cv2.CV_32F, 1, 0, ksize=3) / 8.0
-    gy = cv2.Sobel(Ls, cv2.CV_32F, 0, 1, ksize=3) / 8.0
-    mag = np.hypot(gx, gy)
-    mask = np.zeros((H, W), dtype=bool)
+    grid = [cv2.resize(lab[..., i].astype(np.float32), (W, H), interpolation=cv2.INTER_AREA) for i in range(3)]
+    sm2 = [cv2.GaussianBlur(g, (0, 0), 2.0) for g in grid]
+    # step edges in any Lab channel (a chroma-only edge is still an edge)
+    gmag = np.zeros((H, W), np.float32)
+    for f in sm2:
+        gmag += (cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3) / 8.0) ** 2 + (cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3) / 8.0) ** 2
+    edge = np.sqrt(gmag) > EDGE_L_PER_KNOT
+    # a step edge smoothed at sigma 2 is a band ~4 knots wide; a zone of high gradient that survives
+    # a 3-knot erosion is a steep ramp (a narrow two-colour gradient), not an edge
+    broad = ndi.binary_erosion(edge, iterations=3)
+    if broad.any():
+        broad = ndi.binary_dilation(broad, iterations=3) & edge
+        edge &= ~broad
+    # the transition tail of a blurred edge is a ramp too: exclude a band that grows with the blur
+    kb = 2 * int(band_knots) + 1
+    valid = ~(cv2.dilate(edge.astype(np.uint8), np.ones((kb, kb), np.uint8)) > 0)
+    sm8 = [_nconv(g, valid, 8.0) for g in sm2]
+    g8 = [(cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3) / 8.0, cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3) / 8.0) for f in sm8]
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    for y in range(0, H, block_knots):
-        for x in range(0, W, block_knots):
-            ys, xs = slice(y, min(H, y + block_knots)), slice(x, min(W, x + block_knots))
-            if edges[ys, xs].mean() > edge_density_max:
-                continue
-            v = valid[ys, xs] > 0
-            if v.sum() < 0.5 * v.size:
-                continue
-            m = mag[ys, xs][v]
-            mm = m.mean()
-            if not (grad_min <= mm <= grad_max):
-                continue
-            vx, vy = gx[ys, xs][v].mean(), gy[ys, xs][v].mean()
-            coherence = np.hypot(vx, vy) / (mm + 1e-6)
-            if coherence < 0.8:
-                continue
-            # the raw L inside the block (edge band excluded) must be explained by a plane
-            Lb = Ls[ys, xs][v]
-            A = np.column_stack([xx[ys, xs][v], yy[ys, xs][v], np.ones(int(v.sum()), np.float32)])
-            coef, *_ = np.linalg.lstsq(A, Lb, rcond=None)
-            resid = Lb - A @ coef
-            var = float(Lb.var())
-            r2 = 1.0 - float(resid.var()) / var if var > 1e-6 else 0.0
-            if r2 >= 0.6 and abs(coef[0]) + abs(coef[1]) >= grad_min:
-                mask[ys, xs] = True
+
+    def block_is_ramp(ys, xs, g_min) -> bool:
+        def fail(reason):
+            if debug is not None:
+                debug.append((ys.start, xs.start, ys.stop - ys.start, reason))
+            return False
+        if edge[ys, xs].mean() > edge_density_max:
+            return fail("edges")
+        v = valid[ys, xs]
+        n = int(v.sum())
+        if n < 0.5 * v.size or n < 16:
+            return fail("valid")
+        A = np.column_stack([xx[ys, xs][v], yy[ys, xs][v], np.ones(n, np.float32)])
+        slopes, r2s = [], []
+        for c in range(3):
+            b = sm2[c][ys, xs][v]
+            coef, *_ = np.linalg.lstsq(A, b, rcond=None)
+            resid = b - A @ coef
+            var = float(b.var())
+            slopes.append(float(np.hypot(coef[0], coef[1])))
+            r2s.append(1.0 - float(resid.var()) / var if var > 1e-6 else 0.0)
+        slope = float(np.sqrt(sum(sl * sl for sl in slopes)))
+        if not (g_min <= slope <= grad_max):
+            return fail(f"slope={slope:.2f}")
+        dom = int(np.argmax(slopes))
+        if r2s[dom] < 0.6:
+            return fail(f"r2={r2s[dom]:.2f}")
+        gx, gy = g8[dom]
+        mag = np.hypot(gx[ys, xs][v], gy[ys, xs][v]).mean()
+        coherence = float(np.hypot(gx[ys, xs][v].mean(), gy[ys, xs][v].mean()) / (mag + 1e-6))
+        return coherence >= 0.8 or fail(f"coh={coherence:.2f}")
+
+    mask = np.zeros((H, W), dtype=bool)
+    # 32-knot blocks first (spec), then half-size blocks for what is left so that a region boundary
+    # or a second gradient region inside a block does not cost a whole 32-knot band. The ramp must
+    # span the same absolute Lab range whatever the block size (grad_min is per 32 knots).
+    for bk in (block_knots, max(8, block_knots // 2)):
+        g_min = grad_min * block_knots / bk
+        for y in range(0, H, bk):
+            for x in range(0, W, bk):
+                ys, xs = slice(y, min(H, y + bk)), slice(x, min(W, x + bk))
+                if mask[ys, xs].all():
+                    continue
+                if block_is_ramp(ys, xs, g_min):
+                    mask[ys, xs] = True
+    regions = []
     if mask.any():
+        # cell-level growth into the excluded edge band: a cell up to 6 knots from a region whose
+        # sigma-2 Lab continues that region's plane (|residual| < 4 in every channel) belongs to it
+        # (the boundary between two adjacent gradient regions is otherwise lost to both)
+        lab_m, n = ndi.label(mask)
+        grown = mask.copy()
+        for i in range(1, n + 1):
+            rm = lab_m == i
+            A = np.column_stack([xx[rm], yy[rm], np.ones(int(rm.sum()), np.float32)])
+            coefs = [np.linalg.lstsq(A, f[rm], rcond=None)[0] for f in sm2]
+            cand = ndi.binary_dilation(rm, iterations=6) & ~mask
+            if not cand.any():
+                continue
+            Ac = np.column_stack([xx[cand], yy[cand], np.ones(int(cand.sum()), np.float32)])
+            ok = np.ones(int(cand.sum()), dtype=bool)
+            for f, coef in zip(sm2, coefs):
+                ok &= np.abs(f[cand] - Ac @ coef) < 4.0
+            add = np.zeros_like(mask)
+            add[cand] = ok
+            grown |= add
+        mask = grown
         k = np.ones((8, 8), np.uint8)
         mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
         lab_m, n = ndi.label(mask)
         sizes = ndi.sum(mask, lab_m, index=np.arange(1, n + 1))
         keep = np.zeros_like(mask)
-        regions = []
-        for i, s in enumerate(sizes, start=1):
-            if s < 64:
+        Lg, ag, bg = grid
+        min_range = 2.0 * grad_min * block_knots   # a ramp worth dithering spans at least this much
+        for i, sz in enumerate(sizes, start=1):
+            if sz < 64:
                 continue
             rm = lab_m == i
+            if max(float(np.percentile(f[rm], 95) - np.percentile(f[rm], 5)) for f in sm8) < min_range:
+                continue   # residual illumination, not a designed gradient
             keep |= rm
+            # ramp direction: mean sigma-8 gradient of the channel with the largest range inside the region
+            ranges = [float(np.percentile(f[rm], 95) - np.percentile(f[rm], 5)) for f in sm8]
+            gx, gy = g8[int(np.argmax(ranges))]
             d = np.array([gy[rm].mean(), gx[rm].mean()])
             d = d / (np.linalg.norm(d) + 1e-9)
-            ys, xs = np.nonzero(rm)
-            proj = ys * d[0] + xs * d[1]
+            ys_, xs_ = np.nonzero(rm)
+            proj = ys_ * d[0] + xs_ * d[1]
             lo, hi = np.percentile(proj, 5), np.percentile(proj, 95)
             sel_lo, sel_hi = proj <= lo + 1e-6, proj >= hi - 1e-6
             lab_lo = [float(Lg[rm][sel_lo].mean()), float(ag[rm][sel_lo].mean()), float(bg[rm][sel_lo].mean())]
             lab_hi = [float(Lg[rm][sel_hi].mean()), float(ag[rm][sel_hi].mean()), float(bg[rm][sel_hi].mean())]
-            regions.append({"id": len(regions), "area_knots": int(s), "direction": d.tolist(),
+            regions.append({"id": len(regions), "area_knots": int(sz), "direction": d.tolist(),
                             "lab_lo": lab_lo, "lab_hi": lab_hi,
-                            "bbox": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]})
+                            "bbox": [int(xs_.min()), int(ys_.min()), int(xs_.max()), int(ys_.max())]})
         mask = keep
-    else:
-        regions = []
     return mask, regions
 
 
 # ----------------------------------------------------------------------------- 6. coarse labels
+
+def knot_centre_rgb(rect_rgb: np.ndarray, W: int, H: int) -> np.ndarray:
+    """(H, W, 3) mean of the central 2x2 px of every knot cell (4 px/knot)."""
+    if rect_rgb.shape[0] != H * PX_PER_KNOT or rect_rgb.shape[1] != W * PX_PER_KNOT:
+        rect_rgb = cv2.resize(rect_rgb, (W * PX_PER_KNOT, H * PX_PER_KNOT), interpolation=cv2.INTER_AREA)
+    r = rect_rgb.reshape(H, PX_PER_KNOT, W, PX_PER_KNOT, 3)[:, 1:3, :, 1:3, :]
+    return r.astype(np.float32).mean(axis=(1, 3))
+
 
 def coarse_labels(rect_rgb: np.ndarray, W: int, H: int, k: int = 16, merge_de: float = 8.0):
     small = _resize_long(rect_rgb, 400)
@@ -344,56 +423,104 @@ def coarse_labels(rect_rgb: np.ndarray, W: int, H: int, k: int = 16, merge_de: f
     shares = np.array([(km.labels_ == c).sum() for c in alive], dtype=np.float64) / max(1, len(km.labels_))
     keep = [c for c, s_ in zip(alive, shares) if s_ >= 0.01] or [alive[int(np.argmax(shares))]]
     centers = centers[keep]
-    grid_rgb = cv2.resize(rect_rgb, (W, H), interpolation=cv2.INTER_AREA)
-    glab = rgb_to_lab(grid_rgb).reshape(-1, 3)
-    d = delta_e2000(glab[:, None, :], centers[None, :, :])
+    # each knot is sampled at its centre 2x2 px (not the full 4x4 mean): a 1-knot line or a diagonal
+    # staircase cell keeps its own colour instead of a mix with the neighbour
+    glab = rgb_to_lab(knot_centre_rgb(rect_rgb, W, H))
+    d = delta_e2000(glab.reshape(-1, 3)[:, None, :], centers[None, :, :])
     labels = np.argmin(d, axis=1).astype(np.int32).reshape(H, W)
+    labels = _absorb_transition_bands(labels, glab, centers)
+    # a centre that lost its cells to the absorption is no yarn: recount for n_colors_est
+    shares = np.bincount(labels.ravel(), minlength=len(centers)) / labels.size
+    alive = np.nonzero(shares >= 0.01)[0]
+    if len(alive) < len(centers) and len(alive) > 0:
+        lut = np.full(len(centers), -1, np.int32)
+        lut[alive] = np.arange(len(alive))
+        dead = labels[..., None] == np.nonzero(shares < 0.01)[0][None, None, :]
+        if dead.any():
+            dd = delta_e2000(glab[dead.any(-1)][:, None, :], centers[alive][None, :, :])
+            labels = labels.copy()
+            labels[dead.any(-1)] = alive[np.argmin(dd, axis=1)]
+        labels = lut[labels]
+        centers = centers[alive]
     return labels, centers
 
 
-def thin_line_frac(labels: np.ndarray, line_min_knots: int, line_max_width: int,
-                   centers: Optional[np.ndarray] = None) -> float:
-    """Knot share of is_thin components. A thin component whose colour lies between the colours of its
-    two dominant neighbours (a pile-blur transition band between two yarns) is not a line and is skipped."""
-    total = 0
+def _absorb_transition_bands(labels: np.ndarray, glab: np.ndarray, centers: np.ndarray,
+                             line_min_knots: int = 6, line_max_width: int = 1, near_de: float = 12.0) -> np.ndarray:
+    """Thin components sandwiched between two different larger neighbours whose colour is a mix of the
+    two (pile-blur transition band) or close to one of them (JPEG chroma halo) are photo artefacts,
+    not drawn lines: every cell goes to the nearer of the two neighbours. A genuine outline (far from
+    both neighbours) survives."""
+    out = labels.copy()
     struct = ndi.generate_binary_structure(2, 1)
     for c in connected_components(labels):
         if c.area < line_min_knots:
             continue
         fm = c.full_mask(labels.shape)
-        if not is_thin(fm, line_min_knots, line_max_width):
+        if not is_thin(fm, line_min_knots, line_max_width + 1):   # up to 2 knots wide (JPEG halos are)
             continue
-        if centers is not None:
-            ring = ndi.binary_dilation(fm, structure=struct, iterations=1) & ~fm
-            nb = labels[ring]
-            nb = nb[nb != c.index]
-            if len(nb):
-                vals, counts = np.unique(nb, return_counts=True)
-                order = np.argsort(-counts)
-                if len(vals) >= 2 and counts[order[1]] >= 0.25 * counts[order[0]]:
-                    a, b = centers[vals[order[0]]], centers[vals[order[1]]]
-                    m = centers[c.index]
-                    ab = b - a
-                    L2 = float(ab @ ab) + 1e-9
-                    t = float(((m - a) @ ab) / L2)
-                    dist = float(np.linalg.norm(m - (a + t * ab)))
-                    if 0.0 <= t <= 1.0 and dist < 0.35 * np.sqrt(L2):
-                        continue  # transition band, not a drawn line
-        total += c.area
+        ring = ndi.binary_dilation(fm, structure=struct, iterations=1) & ~fm
+        nb = labels[ring]
+        nb = nb[nb != c.index]
+        if len(nb) == 0:
+            continue
+        vals, counts = np.unique(nb, return_counts=True)
+        order = np.argsort(-counts)
+        if len(vals) < 2 or counts[order[1]] < 0.25 * counts[order[0]]:
+            continue
+        n1, n2 = int(vals[order[0]]), int(vals[order[1]])
+        a, b, m = centers[n1], centers[n2], centers[c.index]
+        ab = b - a
+        L2 = float(ab @ ab) + 1e-9
+        t = float(((m - a) @ ab) / L2)
+        between = 0.0 <= t <= 1.0 and float(np.linalg.norm(m - (a + t * ab))) < 0.35 * np.sqrt(L2)
+        near = min(float(delta_e2000(m, a)), float(delta_e2000(m, b))) < near_de
+        if not (between or near):
+            continue
+        cells = glab[fm]
+        da = delta_e2000(cells, a[None, :])
+        db = delta_e2000(cells, b[None, :])
+        out[fm] = np.where(da <= db, n1, n2)
+    return out
+
+
+def thin_line_frac(labels: np.ndarray, line_min_knots: int, line_max_width: int,
+                   valid: Optional[np.ndarray] = None) -> float:
+    """Knot share of is_thin components of the coarse label map (cells with valid == False, i.e. the
+    gradient mask, are excluded). Transition bands are already absorbed by coarse_labels."""
+    total = 0
+    for c in connected_components(labels, valid):
+        if c.area < line_min_knots:
+            continue
+        if is_thin(c.full_mask(labels.shape), line_min_knots, line_max_width):
+            total += c.area
     return float(total / labels.size)
 
 
-def line_frac(edges512: np.ndarray) -> float:
-    e = edges512.astype(np.uint8) * 255
+def edge_image(labels: np.ndarray, gmask: Optional[np.ndarray], min_component: int = EDGE_MIN_COMPONENT) -> np.ndarray:
+    """Grid-resolution edge map for the class features: boundary cells of coarse-label components with
+    area >= min_component knots, outside the gradient mask. Knot-scale texture has no such components."""
+    area = component_area_map(labels)
+    e = boundary_map(labels) & (area >= min_component)
+    if gmask is not None:
+        e &= ~gmask
+    return e
+
+
+def line_frac(edges: np.ndarray) -> float:
+    """Share of edge cells covered by HoughLinesP straight lines (min length 8 % of the short side)."""
+    e = edges.astype(np.uint8) * 255
     if e.sum() == 0:
         return 0.0
     h, w = e.shape
-    lines = cv2.HoughLinesP(e, 1, np.pi / 180, threshold=30, minLineLength=int(min(h, w) * 0.08), maxLineGap=4)
+    min_len = max(5, int(min(h, w) * 0.08))
+    lines = cv2.HoughLinesP(e, 1, np.pi / 180, threshold=max(5, min_len), minLineLength=min_len, maxLineGap=1)
     if lines is None:
         return 0.0
     cover = np.zeros_like(e)
     for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
-        cv2.line(cover, (int(x1), int(y1)), (int(x2), int(y2)), 255, 3)
+        cv2.line(cover, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+    cover = cv2.dilate(cover, np.ones((3, 3), np.uint8))
     return float(((e > 0) & (cover > 0)).sum() / (e > 0).sum())
 
 
@@ -582,8 +709,13 @@ def run(job: Job) -> dict:
     sd = job.stage_dir("structure")
     rd = job.stage_dir("rectify")
     rect_png, con_png = rd / "rectified.png", rd / "rectified_contrast.png"
-    key = job.cache_key("structure", [rect_png, con_png], exclude_prefix="edit_")
+    key = job.cache_key("structure", [rect_png, con_png])
     if job.cached(sd, key) and (sd / "layout.json").exists():
+        # class decision and routing mutate job.params / job.design_class: re-apply them from the
+        # cached layout so that a cache hit leaves the job exactly as a real run would
+        layout = read_json(sd / "layout.json")
+        if "class" in layout:
+            _apply_class(job, layout["class"], layout["class_features"])
         job.timings["structure"] = 0.0
         return job.state
 
@@ -641,12 +773,21 @@ def _analyse(job: Job, rect: np.ndarray, con: np.ndarray, W: int, H: int, sd: Pa
     lab512 = rgb_to_lab(con512)
     L512 = lab512[..., 0].astype(np.float32)
     edges512 = canny_L(con512)
-    ed = float(edges512.mean())
 
     # 1. symmetry
     sym = detect_symmetry(L512)
+    # 5b. gradient mask and 6. coarse labels first: the border, the class features and the regions
+    # are all read off the label map at grid resolution
+    ew = float(grid.get("edge_width_knots") or 1.0)
+    gmask, gregions = gradient_mask(rect, W, H, float(P.get("grad_min", GRAD_MIN_DEFAULT)),
+                                    float(P.get("grad_max", GRAD_MAX_DEFAULT)), band_knots=max(2, int(round(2 + 2 * ew))))
+    gradient_frac = float(gmask.mean())
+    # knot-scale features ignore a 3-knot band around the mask: its boundary is uncertain by that much
+    feat_valid = ~(ndi.binary_dilation(gmask, iterations=3) if gmask.any() else gmask)
+    labels, centers = coarse_labels(rect, W, H)
     # 2./3. border + period
-    border = detect_border(lab512, float(P.get("border_frac_min", 0.03)), float(P.get("border_frac_max", 0.30)))
+    border = detect_border(labels, float(P.get("border_frac_min", 0.03)), float(P.get("border_frac_max", 0.30)),
+                           PX_PER_KNOT / scale)
     period = border_period(L512, border)
     short = min(L512.shape)
     all_det = all(border[e]["detected"] for e in border)
@@ -669,16 +810,13 @@ def _analyse(job: Job, rect: np.ndarray, con: np.ndarray, W: int, H: int, sd: Pa
                  "v2": [v * knots_per_px512 for v in rep["v2"]] if rep["v2"] else None,
                  "conf": rep["conf"]}
     nodes = lattice_nodes(rep_knots["v1"], rep_knots["v2"], H, W) if rep_knots["v1"] else np.zeros((0, 2))
-    # 5b. gradient mask
-    gmask, gregions = gradient_mask(rect, W, H, float(P.get("grad_min", GRAD_MIN_DEFAULT)),
-                                    float(P.get("grad_max", GRAD_MAX_DEFAULT)))
-    gradient_frac = float(gmask.mean())
-    # 6. coarse labels + class
-    labels, centers = coarse_labels(rect, W, H)
-    ns = noise_stats(labels, ~gmask, int(P.get("noise_cc_min", 2)), int(P.get("noise_cc_max", 6)),
+    # 6. class features at grid resolution, outside the gradient mask
+    ns = noise_stats(labels, feat_valid, int(P.get("noise_cc_min", 2)), int(P.get("noise_cc_max", 6)),
                      int(P.get("min_region_knots", 2)))
-    tlf = thin_line_frac(labels, int(P.get("line_min_knots", 6)), int(P.get("line_max_width", 1)), centers)
-    lf = line_frac(edges512)
+    tlf = thin_line_frac(labels, int(P.get("line_min_knots", 6)), int(P.get("line_max_width", 1)), feat_valid)
+    edges = edge_image(labels, ~feat_valid)
+    ed = float(edges.mean())
+    lf = line_frac(edges)
     feats = {"edge_density": ed, "n_colors_est": int(len(centers)), "gradient_frac": gradient_frac,
              "noise_frac": ns["noise_frac"], "noise_1knot_frac": ns["noise_1knot_frac"], "line_frac": lf,
              "thin_line_frac": tlf, "symmetry": sym["kind"], "symmetry_conf": sym["conf"],
@@ -742,6 +880,7 @@ def _analyse(job: Job, rect: np.ndarray, con: np.ndarray, W: int, H: int, sd: Pa
         "symmetry": sym, "border": border, "border_accepted": border_accepted, "frame_hint": frame_hint,
         "border_period": period, "medallion": med, "ground_repeat": rep_knots,
         "lattice_nodes": nodes.tolist(), "gradient_frac": gradient_frac, "class_features": feats,
+        "class": {"class_auto": cls["class_auto"], "class_margin": cls["class_margin"], "fires": cls["fires"]},
         "internal_geometry": ig, "scale_512": scale,
         "_tps_pts": (np.array(tps_src), np.array(tps_dst)) if len(tps_src) >= 16 else None,
     }
