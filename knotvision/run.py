@@ -60,18 +60,23 @@ STAGE_FN = {
 def run_job(job: Job, from_stage: Optional[str] = None) -> dict:
     """Run all stages (or from `from_stage` on). Returns report dict. Raises JobError on hard stops."""
     start = 0 if from_stage is None else STAGES.index(from_stage)
+    job.restore_state()
     if from_stage:
         job.invalidate_from(from_stage)
     # intake always re-validates (cheap) so that params are resolved for a loaded job
     if start > 0 and not job.params:
         job.load_profile()
         job.resolve()
+    job.state.pop("stopped", None)
+    # stages_ran / stages_cached describe THIS invocation
+    job.state["stages_ran"] = []
+    job.state["stages_cached"] = []
     report = None
     for s in STAGES[start:]:
-        if job.state.get("stopped"):
-            job.state.pop("stopped", None)
+        job.begin_stage(s)
         out = STAGE_FN[s](job)
         if s == "export":
             report = out
+    job.state.pop("_stage", None)
     job.save()
     return report

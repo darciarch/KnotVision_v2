@@ -136,7 +136,7 @@ def _corners_from_hough(mask: np.ndarray) -> Optional[np.ndarray]:
                             minLineLength=int(min(h, w) * 0.2), maxLineGap=20)
     if lines is None or len(lines) < 4:
         return None
-    lines = lines[:, 0, :]
+    lines = np.asarray(lines).reshape(-1, 4)
     ang = np.degrees(np.arctan2(lines[:, 3] - lines[:, 1], lines[:, 2] - lines[:, 0])) % 180
     horiz = lines[(ang < 30) | (ang > 150)]
     vert = lines[(ang > 60) & (ang < 120)]
@@ -234,10 +234,14 @@ def detect_fringe(rect_rgb: np.ndarray, fringe_max_frac: float) -> tuple[list, l
 
 # ----------------------------------------------------------------------------- photometry
 
-def gray_world(rgb: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, list, float]:
+def gray_world(rgb: np.ndarray, mask: np.ndarray, clamp: tuple = (0.75, 1.35)) -> tuple[np.ndarray, list, float]:
+    """Gray-world gains, clamped: a strongly coloured rug violates the gray-world assumption and an
+    unclamped gain (e.g. x2.6 on green for a pink rug) destroys colour fidelity. Clamping is reported
+    through wb.confidence (0 when a gain hit the clamp)."""
     f = rgb.astype(np.float32)
     means = np.array([f[..., c][mask].mean() for c in range(3)]) + 1e-6
     gains = means.mean() / means
+    gains = np.clip(gains, clamp[0], clamp[1])
     out = f * gains[None, None, :]
     clipped = float((out > 255).any(axis=2)[mask].mean())
     return np.clip(out, 0, 255).astype(np.uint8), gains.tolist(), clipped
@@ -314,30 +318,48 @@ def edge_width_px(rgb: np.ndarray, max_samples: int = 4000) -> float:
         sel = rng.choice(len(ys), max_samples, replace=False)
         ys, xs = ys[sel], xs[sel]
     H, W = L.shape
-    widths = []
-    r = 12
+    r = 6 * PX_PER_KNOT   # +-6 knots: wide enough for a pile_blur transition (> 2 knots)
     ts = np.arange(-r, r + 1, dtype=np.float32)
-    for y, x in zip(ys, xs):
-        g = np.array([gx[y, x], gy[y, x]])
-        n = np.linalg.norm(g)
-        if n < 1e-3:
+    g = np.stack([gx[ys, xs], gy[ys, xs]], axis=1).astype(np.float32)
+    n = np.linalg.norm(g, axis=1)
+    ok = n > 1e-3
+    if not ok.any():
+        return 1.0
+    d = g[ok] / n[ok, None]
+    px = xs[ok, None].astype(np.float32) + ts[None, :] * d[:, 0:1]
+    py = ys[ok, None].astype(np.float32) + ts[None, :] * d[:, 1:2]
+    inside = (px.min(1) >= 0) & (py.min(1) >= 0) & (px.max(1) <= W - 1) & (py.max(1) <= H - 1)
+    if not inside.any():
+        return 1.0
+    prof = cv2.remap(L, px[inside], py[inside], cv2.INTER_LINEAR)  # (N, 2r+1)
+    lo, hi = prof.min(1), prof.max(1)
+    keep = (hi - lo) >= 3
+    prof, lo, hi = prof[keep], lo[keep], hi[keep]
+    a = lo + 0.1 * (hi - lo)
+    b = lo + 0.9 * (hi - lo)
+    mid = (prof > a[:, None]) & (prof < b[:, None])
+    n_s = mid.shape[1]
+    c = n_s // 2
+    # width of the transition run that contains (or is nearest to) the centre sample
+    widths = np.zeros(len(mid), dtype=np.float32)
+    for i in range(len(mid)):
+        row = mid[i]
+        if not row.any():
+            widths[i] = 1.0
             continue
-        d = g / n
-        px = x + ts * d[0]
-        py = y + ts * d[1]
-        if px.min() < 0 or py.min() < 0 or px.max() > W - 1 or py.max() > H - 1:
-            continue
-        prof = cv2.remap(L, px.reshape(1, -1), py.reshape(1, -1), cv2.INTER_LINEAR)[0]
-        lo, hi = prof.min(), prof.max()
-        if hi - lo < 3:
-            continue
-        a = lo + 0.1 * (hi - lo)
-        b = lo + 0.9 * (hi - lo)
-        inside = np.nonzero((prof > a) & (prof < b))[0]
-        if len(inside) == 0:
-            widths.append(1.0)
+        if row[c]:
+            j = c
         else:
-            widths.append(float(inside.max() - inside.min() + 1))
+            nz = np.nonzero(row)[0]
+            j = int(nz[np.argmin(np.abs(nz - c))])
+        l = j
+        while l - 1 >= 0 and row[l - 1]:
+            l -= 1
+        r_ = j
+        while r_ + 1 < n_s and row[r_ + 1]:
+            r_ += 1
+        widths[i] = float(r_ - l + 1)
+    widths = widths.tolist()
     return float(np.median(widths)) if widths else 1.0
 
 
@@ -457,8 +479,11 @@ def run(job: Job) -> dict:
 
     # 10. white balance
     rect, gains, clipped = gray_world(rect, full)
-    job.state["wb"] = {"gains": gains, "clipped_pct": clipped,
-                       "confidence": float(1.0 - min(1.0, abs(np.log(max(gains) / min(gains))) * 2))}
+    clamped = bool(min(gains) <= 0.751 or max(gains) >= 1.349)
+    job.state["wb"] = {"gains": gains, "clipped_pct": clipped, "clamped": clamped,
+                       "confidence": 0.0 if clamped else float(1.0 - min(1.0, abs(np.log(max(gains) / min(gains))) * 2))}
+    if clamped:
+        job.warn("wb_clamped")
 
     # 11. illumination flattening
     rect_flat, illum = flatten_illumination(rect, deg=int(P.get("illum_poly_deg", 2)))

@@ -76,19 +76,18 @@ def component_area_map(indexed: np.ndarray, connectivity: int = 1) -> np.ndarray
 def is_thin(mask: np.ndarray, line_min_knots: int = 6, line_max_width: int = 1) -> bool:
     """Skeleton length >= line_min_knots AND max local width <= line_max_width.
 
-    Local width is taken from the distance transform on the skeleton: width ~= 2 * dist - 1.
-    Single home of this rule (production, structure, tools/motif_stats.py all call it).
+    Width rule: a component is at most w knots wide iff it contains no fully foreground
+    (w+1) x (w+1) block (exact for axis-aligned runs, tight for diagonals). Single home of this rule
+    (production, structure, tools/motif_stats.py all call it).
     """
     m = np.asarray(mask, dtype=bool)
     if m.sum() < line_min_knots:
         return False
-    sk = skeletonize(m)
-    sk_len = int(sk.sum())
-    if sk_len < line_min_knots:
+    k = int(line_max_width) + 1
+    if ndi.binary_erosion(m, structure=np.ones((k, k), bool), border_value=0).any():
         return False
-    dist = ndi.distance_transform_cdt(m, metric="taxicab")
-    width = 2 * dist[sk].max() - 1
-    return bool(width <= line_max_width)
+    sk = skeletonize(m)
+    return bool(int(sk.sum()) >= line_min_knots)
 
 
 # ----------------------------------------------------------------------------- edges

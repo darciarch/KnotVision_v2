@@ -137,26 +137,115 @@ def _circle_fit(pts: np.ndarray) -> tuple[np.ndarray, float, float]:
     return np.array([cy, cx]), float(r), float(res)
 
 
+def _presmooth(contour: np.ndarray, size: int = 5) -> np.ndarray:
+    """Moving average (size 5, wrap) along a closed contour before DP: +-1 knot jitter on a staircase
+    shrinks below the DP tolerance while an ideal staircase becomes its underlying straight line
+    (the corner rounding this causes stays below the tolerance and the angle lock re-snaps)."""
+    if len(contour) < size + 2:
+        return contour
+    return ndi.uniform_filter1d(contour, size=size, axis=0, mode="wrap")
+
+
+def _free_run(orig: np.ndarray, tol: float) -> np.ndarray:
+    """Free segment: run-length median (size 5) -> piecewise-constant monotone steps; endpoints and
+    total extent preserved; falls back to the original if any point moves more than `tol`."""
+    if len(orig) <= 3:
+        return orig
+    sm = ndi.median_filter(orig, size=(5, 1), mode="nearest")
+    sm[0], sm[-1] = orig[0], orig[-1]
+    dev = np.hypot(*(sm - orig).T).max()
+    return sm if dev <= tol else orig
+
+
+def _arc_run(contour: np.ndarray, idx: list, i: int, tol: float, min_pts: int = 8) -> tuple:
+    """Longest run of DP vertices idx[i..j] (j >= i+3) whose contour points fit one circle with rms
+    residual <= tol and a sagitta > tol (otherwise a line describes them). (j, centre, r) or (None,)*3."""
+    best = (None, None, None)
+    for j in range(i + 3, len(idx)):
+        pts = contour[idx[i]:idx[j] + 1]
+        if len(pts) < min_pts:
+            continue
+        c, r, res = _circle_fit(pts)
+        chord = float(np.hypot(*(pts[-1] - pts[0])))
+        sagitta = r - np.sqrt(max(0.0, r * r - (chord / 2) ** 2))
+        if res <= tol and 2.0 <= r < 1e4 and sagitta > tol:
+            best = (j, c, r)
+        else:
+            break
+    return best
+
+
+def _line_rms(pts: np.ndarray) -> float:
+    """rms distance of pts to their least-squares line."""
+    if len(pts) < 3:
+        return 0.0
+    c = pts.mean(0)
+    u, s_, vt = np.linalg.svd(pts - c, full_matrices=False)
+    n = vt[1]
+    return float(np.sqrt(np.mean(((pts - c) @ n) ** 2)))
+
+
+def _line_run(contour: np.ndarray, idx: list, i: int, tol: float) -> int:
+    """Longest j > i such that contour[idx[i]:idx[j]+1] lies on one line (rms <= tol, max <= 2 tol)."""
+    best = i + 1
+    for j in range(i + 1, len(idx)):
+        pts = contour[idx[i]:idx[j] + 1]
+        if len(pts) < 2:
+            continue
+        a, b = pts[0], pts[-1]
+        ab = b - a
+        L = float(np.hypot(*ab))
+        if L < 1e-9:
+            break
+        rel = pts - a
+        dmax = float(np.abs(ab[0] * rel[:, 1] - ab[1] * rel[:, 0]).max() / L)
+        if _line_rms(pts) <= tol and dmax <= 2 * tol:
+            best = j
+        else:
+            break
+    return best
+
+
 def regularize_contour(contour: np.ndarray, tol: float, min_line: int, free_runs: bool) -> tuple[np.ndarray, dict]:
-    """contour: (N, 2) closed polyline (row, col). Returns (new polyline, segment class lengths)."""
+    """contour: (N, 2) closed polyline (row, col). Returns (new polyline, segment class lengths).
+
+    1. moving-average pre-smoothing, 2. Douglas-Peucker at `tol` (segmentation only),
+    3. greedy runs over DP vertices: the longest of {line run (LS rms <= tol), arc run (circle rms <=
+    tol, sagitta > tol, >= 3 DP segments)} wins, a line on ties; a line run >= min_line is angle-locked;
+    a run shorter than min_line is a free segment (run-length median, endpoints kept)."""
+    contour = _presmooth(np.asarray(contour, dtype=np.float64))
     approx = approximate_polygon(contour, tolerance=tol)
     if len(approx) < 4:
         return contour, {"line": 0.0, "arc": 0.0, "free": float(_length(contour))}
     stats = {"line": 0.0, "arc": 0.0, "free": 0.0}
-    out = [approx[0].copy()]
-    # map approx vertices back to indices in the original contour for arc fitting
     idx = [int(np.argmin(np.hypot(*(contour - v).T))) for v in approx]
-    for i in range(1, len(approx)):
-        a, b = out[-1], approx[i].copy()
+    for k in range(1, len(idx)):
+        if idx[k] <= idx[k - 1]:
+            idx[k] = idx[k - 1] + 1
+    idx = [min(i, len(contour) - 1) for i in idx]
+    idx[-1] = len(contour) - 1
+    out = [contour[idx[0]].copy()]
+    i = 0
+    while i < len(idx) - 1:
+        jl = _line_run(contour, idx, i, tol)
+        ja, c, r = _arc_run(contour, idx, i, tol)
+        pts = contour[idx[i]:idx[jl] + 1]
+        if ja is not None and ja > jl:
+            pts = contour[idx[i]:idx[ja] + 1]
+            ang = np.arctan2(pts[:, 0] - c[0], pts[:, 1] - c[1])
+            snapped = np.column_stack([c[0] + r * np.sin(ang), c[1] + r * np.cos(ang)])
+            snapped[0], snapped[-1] = out[-1], pts[-1]
+            out.extend(snapped[1:].tolist())
+            stats["arc"] += float(_length(pts))
+            i = ja
+            continue
+        a = np.asarray(out[-1], dtype=np.float64)
+        b = pts[-1].copy()
         seg = b - a
         L = float(np.hypot(*seg))
-        i0, i1 = idx[i - 1], idx[i]
-        orig = contour[i0:i1 + 1] if i1 >= i0 else np.vstack([contour[i0:], contour[:i1 + 1]])
         if L >= min_line:
-            # straight? original points close to the chord (DP guarantees <= tol) -> line with angle lock
             theta = np.degrees(np.arctan2(seg[0], seg[1]))
-            snapped = _snap_angle(theta)
-            d = np.array([np.sin(np.radians(snapped)), np.cos(np.radians(snapped))])
+            d = np.array([np.sin(np.radians(_snap_angle(theta))), np.cos(np.radians(_snap_angle(theta)))])
             if np.dot(d, seg) < 0:
                 d = -d
             b_new = a + d * L
@@ -164,23 +253,11 @@ def regularize_contour(contour: np.ndarray, tol: float, min_line: int, free_runs
                 b = b_new
             out.append(b)
             stats["line"] += L
-            continue
-        if len(orig) >= 8:
-            _, r, res = _circle_fit(orig)
-            if res <= tol and r < 1e4:
-                out.extend(orig[1:].tolist())
-                stats["arc"] += float(_length(orig))
-                continue
-        # free
-        if free_runs and len(orig) > 3:
-            sm = ndi.median_filter(orig, size=(5, 1), mode="nearest")
-            sm[0], sm[-1] = orig[0], orig[-1]
-            dev = np.hypot(*(sm - orig).T).max()
-            pts = sm if dev <= tol else orig
         else:
-            pts = orig
-        out.extend(np.asarray(pts)[1:].tolist())
-        stats["free"] += float(_length(orig))
+            fr = _free_run(pts, tol) if free_runs else pts
+            out.extend(np.asarray(fr)[1:].tolist())
+            stats["free"] += float(_length(pts))
+        i = jl
     out = np.array(out, dtype=np.float64)
     return out, stats
 
@@ -225,7 +302,8 @@ def smooth_boundaries(indexed: np.ndarray, protected: np.ndarray, params: dict) 
             new, st = regularize_contour(ct, tol, min_line, free_runs)
             for key in stats:
                 stats[key] += st[key]
-            rr, cc = draw_polygon(new[:, 0], new[:, 1], shape=indexed.shape)
+            # +0.01 row shift: a deterministic tie-break for cell centres lying exactly on a diagonal edge
+            rr, cc = draw_polygon(new[:, 0] + 0.01, new[:, 1], shape=indexed.shape)
             if k == 0:
                 fill[rr, cc] = True
             else:

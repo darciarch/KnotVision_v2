@@ -251,6 +251,29 @@ class Job:
     def warn(self, code: str):
         if code not in self.warnings:
             self.warnings.append(code)
+        stage = self.state.get("_stage")
+        if stage:
+            per = self.state.setdefault("warnings_by_stage", {}).setdefault(stage, [])
+            if code not in per:
+                per.append(code)
+
+    def begin_stage(self, name: str):
+        """Called by the orchestrator before a stage runs: warnings that this stage produced in an
+        earlier run are dropped (they are restored from the stage cache if the stage is skipped)."""
+        self.state["_stage"] = name
+        per = self.state.setdefault("warnings_by_stage", {})
+        old = per.get(name, [])
+        if old:
+            self.state["warnings"] = [w for w in self.warnings if w not in old]
+        per[name] = []
+
+    def restore_state(self):
+        """Load state/timings persisted in job.json (needed when earlier stages are served from cache)."""
+        if self.job_json.exists() and not self.state:
+            d = json.loads(self.job_json.read_text())
+            self.state = d.get("state", {})
+            self.timings = d.get("timings_s", {})
+            self.state.pop("stopped", None)
 
     def has_warning(self, code: str) -> bool:
         return code in self.warnings
@@ -376,10 +399,24 @@ class Job:
 
     def cached(self, stage_dir: Path, key: str) -> bool:
         f = stage_dir / "input_hash.txt"
-        return f.exists() and f.read_text().strip() == key and (stage_dir / "done").exists()
+        hit = f.exists() and f.read_text().strip() == key and (stage_dir / "done").exists()
+        if hit:
+            wf = stage_dir / "warnings.json"
+            if wf.exists():
+                for w in json.loads(wf.read_text()):
+                    self.warn(w)
+            stage = self.state.get("_stage")
+            if stage and stage in STAGES and stage not in self.state.get("stages_ran", []):
+                self.state.setdefault("stages_cached", [])
+                if stage not in self.state["stages_cached"]:
+                    self.state["stages_cached"].append(stage)
+        return hit
 
     def mark_done(self, stage_dir: Path, key: str):
         (stage_dir / "input_hash.txt").write_text(key)
+        stage = self.state.get("_stage")
+        per = self.state.get("warnings_by_stage", {}).get(stage, []) if stage else []
+        (stage_dir / "warnings.json").write_text(json.dumps(per))
         (stage_dir / "done").write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
 
     def invalidate_from(self, stage: str):
@@ -390,6 +427,7 @@ class Job:
             if (d / "done").exists():
                 (d / "done").unlink()
         self.state["stages_ran"] = [s for s in self.state.get("stages_ran", []) if STAGES.index(s) < i]
+        self.state["stages_cached"] = [s for s in self.state.get("stages_cached", []) if STAGES.index(s) < i]
 
 
 def _json_default(o):

@@ -29,6 +29,8 @@ def grid_from_density(width_cm: float, height_cm: float, density, reed_per_m: Op
     wefts_per_m:  wefts_per_m = density
     reed_x_wefts: density = [reed, wefts]; reed must equal the loom's reed_per_m
     reed_per_m None: only with knots_m2, k = sqrt(density) for both axes -> grid_unverified.
+    grid_rounding: the fractional knot count is within 0.1 of a midpoint (rounding error >= 0.4 knot),
+    i.e. the integer grid is ambiguous (the spec's "> 0.5" cannot occur for a nearest-integer rounding).
     """
     warnings = []
     if density_definition not in ("knots_m2", "wefts_per_m", "reed_x_wefts"):
@@ -59,7 +61,7 @@ def grid_from_density(width_cm: float, height_cm: float, density, reed_per_m: Op
     Wf = width_cm / 100.0 * reed
     Hf = height_cm / 100.0 * wefts
     W, H = int(round(Wf)), int(round(Hf))
-    if abs(Wf - W) > 0.5 or abs(Hf - H) > 0.5:
+    if abs(Wf - W) >= 0.4 or abs(Hf - H) >= 0.4:
         warnings.append("grid_rounding")
     if W < 2 or H < 2:
         raise JobError("bad_grid", f"grid too small: {W}x{H}")

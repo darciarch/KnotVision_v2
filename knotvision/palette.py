@@ -25,7 +25,7 @@ from sklearn.cluster import KMeans
 
 from .color import delta_e2000, hex_of, lab_to_rgb, rgb_to_lab
 from .job import Job, dump_json, read_json
-from .metrics import guided
+from .metrics import canny_L, guided
 
 
 def _resize_long(img, long_px):
@@ -48,14 +48,23 @@ def cluster_photo(rect_rgb: np.ndarray, gmask_grid: Optional[np.ndarray], machin
         gm = cv2.resize(gmask_grid.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
     else:
         gm = np.zeros((h, w), dtype=bool)
+    # pixels within 2 px of an edge are pile-blur transition colours, not yarns: excluded from the fit
+    band = cv2.dilate(canny_L(small).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     k = min(4 * machine_colors, max(2, (~gm).sum() // 50))
     flat = lab.reshape(-1, 3)
-    valid = ~gm.reshape(-1)
+    valid = (~gm & ~band).reshape(-1)
+    if valid.sum() < 100:
+        valid = ~gm.reshape(-1)
     X = flat[valid] if valid.any() else flat
     km = KMeans(n_clusters=min(k, len(X)), random_state=seed, n_init=4).fit(X)
     labels_img = np.full(h * w, -1, dtype=np.int32)
     labels_img[valid] = km.labels_
     labels_img = labels_img.reshape(h, w)
+    # fill the band with the nearest labelled pixel so that adjacency is measured across it
+    if (labels_img < 0).any() and (labels_img >= 0).any():
+        _, (iy, ix) = ndi.distance_transform_edt(labels_img < 0, return_indices=True)
+        filled = labels_img[iy, ix]
+        labels_img = np.where(gm, -1, filled)
     centers = km.cluster_centers_.copy()
     counts = np.bincount(km.labels_, minlength=len(centers)).astype(np.float64)
     weights = counts ** area_weight_exp
