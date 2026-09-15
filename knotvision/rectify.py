@@ -17,6 +17,7 @@ Spec deviations:
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,40 +38,128 @@ PLATEAU_KNOTS = 1.5   # a resolved edge keeps a flat plateau this long on both s
 
 # ----------------------------------------------------------------------------- SAM 3.1 wrapper
 
-def sam_segment(photo_rgb: np.ndarray, prompts=SAM_PROMPTS, min_score: float = 0.3) -> np.ndarray:
-    """Text-prompted SAM 3.1 carpet mask. Selection: score x area, next prompt when score < min_score.
+_SAM_CACHE: dict = {}
 
-    Raises JobError("sam_unavailable") when the package or the checkpoint is missing or inference fails.
+
+def _sam_cpu_patches(torch):
+    """sam3 0.1.0 assumes a CUDA device at inference time in two places; on a CPU-only machine both are
+    neutralised once per process (idempotent):
+
+    * the ViT MLP goes through perflib.fused.addmm_act, which casts to bfloat16 unconditionally (the
+      surrounding CUDA autocast makes the next Linear accept that). Without autocast the fp32 fc2 rejects
+      the bf16 input, so the fused op is replaced by the plain fp32 Linear + activation;
+    * the geometry encoder calls Tensor.pin_memory(), which raises without an accelerator; pinning is a
+      host-to-device transfer optimisation and a no-op is exact on the CPU.
     """
+    if getattr(torch, "_knotvision_sam_cpu", False):
+        return
+    F = torch.nn.functional
+    try:
+        from sam3.model import vitdet  # type: ignore
+
+        def addmm_act(activation, linear, mat1):
+            y = F.linear(mat1, linear.weight, linear.bias)
+            if activation in (F.relu, torch.nn.ReLU):
+                return F.relu(y)
+            if activation in (F.gelu, torch.nn.GELU):
+                return F.gelu(y)
+            raise ValueError(f"Unexpected activation {activation}")
+
+        vitdet.addmm_act = addmm_act
+    except Exception:  # pragma: no cover
+        pass
+    _orig_pin = torch.Tensor.pin_memory
+
+    def pin_memory(self, *a, **k):
+        if self.device.type == "cpu" and not torch.cuda.is_available():
+            return self
+        return _orig_pin(self, *a, **k)
+
+    torch.Tensor.pin_memory = pin_memory  # type: ignore[method-assign]
+    torch._knotvision_sam_cpu = True
+
+
+@contextlib.contextmanager
+def _sam_cpu_shim(torch, device: str):
+    """sam3 0.1.0 builds two constant caches with a hard-coded device="cuda"
+    (PositionEmbeddingSine precompute, decoder box-RPB coords). On a CPU-only machine those
+    factory calls are redirected to the CPU for the duration of the model build; nothing else changes."""
+    if device == "cuda":
+        yield
+        return
+    orig = {name: getattr(torch, name) for name in ("zeros", "arange")}
+
+    def _wrap(fn):
+        def inner(*a, **k):
+            if k.get("device") == "cuda":
+                k["device"] = "cpu"
+            return fn(*a, **k)
+        return inner
+
+    for name, fn in orig.items():
+        setattr(torch, name, _wrap(fn))
+    try:
+        yield
+    finally:
+        for name, fn in orig.items():
+            setattr(torch, name, fn)
+
+
+def _sam_processor(min_score: float):
+    """Builds (once per process) the SAM 3.1 image model + processor on the available device."""
     ckpt_dir = MODELS_DIR / "sam3.1"
     ckpts = sorted(ckpt_dir.glob("*.pt")) if ckpt_dir.exists() else []
     if not ckpts:
         raise JobError("sam_unavailable", f"no checkpoint (*.pt) in {ckpt_dir}")
     try:
-        import torch  # noqa: F401
+        import torch
         from sam3.model_builder import build_sam3_image_model  # type: ignore
         from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore
     except Exception as e:  # pragma: no cover - needs the real package
         raise JobError("sam_unavailable", f"sam3 import failed: {e}")
-    try:  # pragma: no cover - needs weights + GPU
-        model = build_sam3_image_model(checkpoint_path=str(ckpts[0]))
-        proc = Sam3Processor(model)
+    key = (str(ckpts[0]), float(min_score))
+    if key in _SAM_CACHE:
+        return _SAM_CACHE[key]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        _sam_cpu_patches(torch)
+    # load_from_HF=False: the checkpoint is local; never reach for the network here
+    with _sam_cpu_shim(torch, device):
+        model = build_sam3_image_model(checkpoint_path=str(ckpts[0]), device=device, load_from_HF=False)
+    proc = Sam3Processor(model, device=device, confidence_threshold=min_score)
+    _SAM_CACHE.clear()
+    _SAM_CACHE[key] = proc
+    return proc
+
+
+def sam_segment(photo_rgb: np.ndarray, prompts=SAM_PROMPTS, min_score: float = 0.3) -> np.ndarray:
+    """Text-prompted SAM 3.1 carpet mask. Selection: score x area, next prompt when score < min_score.
+
+    Raises JobError("sam_unavailable") when the package or the checkpoint is missing or inference fails,
+    JobError("needs_corners") when no prompt yields a mask above `min_score`.
+    """
+    proc = _sam_processor(min_score)
+    try:  # pragma: no cover - needs weights
+        import torch
         from PIL import Image
-        state = proc.set_image(Image.fromarray(photo_rgb))
-        best, best_val = None, -1.0
-        for p in prompts:
-            out = proc.set_text_prompt(state=state, prompt=p)
-            masks, scores = out["masks"], out["scores"]
-            for m, s in zip(masks, scores):
-                s = float(s)
-                if s < min_score:
-                    continue
-                m = np.asarray(m).astype(bool)
-                val = s * m.mean()
-                if val > best_val:
-                    best, best_val = m, val
-            if best is not None:
-                break
+        with torch.inference_mode():
+            state = proc.set_image(Image.fromarray(np.ascontiguousarray(photo_rgb)))
+            best, best_val = None, -1.0
+            for p in prompts:
+                out = proc.set_text_prompt(prompt=p, state=state)
+                masks = out["masks"].detach().cpu().numpy().reshape(-1, photo_rgb.shape[0], photo_rgb.shape[1])
+                scores = out["scores"].detach().cpu().numpy().reshape(-1)
+                for m, s in zip(masks, scores):
+                    s = float(s)
+                    if s < min_score:
+                        continue
+                    m = m.astype(bool)
+                    val = s * m.mean()
+                    if val > best_val:
+                        best, best_val = m, val
+                if best is not None:
+                    break
+                proc.reset_all_prompts(state)
         if best is None:
             raise JobError("needs_corners", "SAM found no carpet")
         return best

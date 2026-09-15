@@ -30,9 +30,34 @@ SHARP = {"blur_knots": 0.6, "px_per_knot": 3.0, "illum": 0.12, "shade_a": 0.08, 
          "fringe": False, "non_planar": False, "occlusion": False, "noise_sigma": 2.0, "jpeg_q": 92, "tilt": 0.05}
 
 
+def pytest_addoption(parser):
+    parser.addoption("--run-slow", action="store_true", default=False,
+                     help="run tests marked slow (real model inference on the CPU, minutes)")
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "gpu: needs GPU + weights")
     config.addinivalue_line("markers", "slow: long-running")
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """`gpu` tests are skipped without CUDA, `slow` tests unless --run-slow is given."""
+    skip_gpu = pytest.mark.skip(reason="needs a GPU")
+    skip_slow = pytest.mark.skip(reason="slow: pass --run-slow")
+    has_cuda = _cuda_available()
+    for item in items:
+        if "gpu" in item.keywords and not has_cuda:
+            item.add_marker(skip_gpu)
+        if "slow" in item.keywords and not config.getoption("--run-slow"):
+            item.add_marker(skip_slow)
 
 
 @pytest.fixture(scope="session")

@@ -40,12 +40,28 @@ def test_corner_detection_from_mask_synthetic(geometric_pair):
     assert err < 8
 
 
-def test_sam_unavailable_without_corners(geometric_pair, tmp_root):
+def test_sam_unavailable_without_corners(geometric_pair, tmp_root, tmp_path, monkeypatch):
+    # no checkpoint under models/: the sam_unavailable warning + needs_corners stop, whatever is installed
+    monkeypatch.setattr(rectify, "MODELS_DIR", tmp_path / "no_models")
     job = make_job(geometric_pair["dir"], tmp_root / "runs", "geometric", job_id="geo_nosam", corners_override=None)
     with pytest.raises(JobError) as e:
         run(job)
     assert e.value.code == "needs_corners"
     assert "sam_unavailable" in job.warnings
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not list((rectify.MODELS_DIR / "sam3.1").glob("*.pt")), reason="models/sam3.1 not downloaded")
+def test_sam_corners_match_ground_truth(geometric_pair, tmp_root):
+    """Real SAM 3.1 (CPU is fine, ~1 min): the mask-derived corners land within 1 knot of the truth."""
+    job = make_job(geometric_pair["dir"], tmp_root / "runs", "geometric", job_id="geo_sam", corners_override=None)
+    rep = run(job)
+    c = read_json(job.stage_dir("rectify") / "corners.json")
+    assert c["manual"] is False and not c["weak"]
+    gt = np.array(geometric_pair["render"]["corners"])
+    ppk = geometric_pair["render"]["meta"]["px_per_knot"]
+    assert np.abs(np.array(c["corners"]) - gt).max() < 1.5 * ppk
+    assert "sam_unavailable" not in job.warnings and "needs_corners" not in rep["qc"]["hard_gate_failures"]
 
 
 def test_fringe_detection_and_strip_back_projection(tmp_root):

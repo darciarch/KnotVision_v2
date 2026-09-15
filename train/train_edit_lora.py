@@ -21,8 +21,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:  # pragma: no cover - annotation only; PIL is imported lazily where used
+    from PIL import Image as PILImage
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -68,7 +72,7 @@ def prompt_for(rec: dict, pairs_root: Path | None = None) -> str:
     return PR.base_prompt(hexes, rec["design_class"])
 
 
-def palette_card_for(hexes_rgb: list) -> "PIL.Image.Image":
+def palette_card_for(hexes_rgb: list) -> "PILImage.Image":
     from PIL import Image
     from knotvision.palette import palette_card
     entries = [{"rgb": list(c)} for c in hexes_rgb]
@@ -93,8 +97,8 @@ def main(argv=None):
         return 1
     try:
         import torch
-        from diffusers import QwenImageEditPlusPipeline
-        from peft import LoraConfig
+        from diffusers import QwenImageEditPlusPipeline  # type: ignore[import-not-found]
+        from peft import LoraConfig  # type: ignore[import-not-found]
     except ImportError as e:
         print(f"diffusers/peft/torch required: {e}", file=sys.stderr)
         return 2

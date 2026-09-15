@@ -9,8 +9,9 @@ and identifiers are English.
 ## Environment
 
 - `.venv/bin/python` (3.14). Core deps only; torch / diffusers / sam3 are optional and imported lazily.
-  The modelless chain and every test run without them. No model weights, no archive, no real pairs and no
-  `data/photo_survey.csv` exist yet: every job is `needs_review` by design (`cli.py setup-check` lists why).
+  The modelless chain and every test run without them. Only SAM 3.1 (`models/sam3.1/`, CPU-capable) is
+  present; no archive, no real pairs, no `qc_calib.json` and no `data/photo_survey.csv` exist yet, so every
+  job is `needs_review` by design (`cli.py setup-check` lists why).
 - OpenCV is 5.x (`opencv-contrib-python-headless`): `HoughLinesP` returns `(N, 4)` — always
   `np.asarray(lines).reshape(-1, 4)`; `cv2.remap` maps must be `float32`.
 - Tests: `.venv/bin/pytest` (≈ 2 min; session-scoped fixtures render the synthetic rugs once). `gpu` and
@@ -106,49 +107,48 @@ replaces it with its inner neighbour ring. Measurements that sit near the gradie
 - Every hard gate / warning code in the spec has a test that triggers it. A threshold test asserts the
   spec's rule, not a number the fixture happened to produce.
 - Model-dependent paths (`segment` inference, real backends) are tested through fallbacks and
-  monkeypatched loaders on CPU; real inference sits behind `@pytest.mark.gpu`.
+  monkeypatched loaders on CPU; real inference sits behind `@pytest.mark.gpu` (needs CUDA) or
+  `@pytest.mark.slow` (CPU-capable, `pytest --run-slow`).
 
 ## Status (2026-09-15, uncommitted work in the tree)
 
-Full `pytest` on this laptop (Iris Xe, no CUDA) takes ≈ 6 min. Last complete run (before the final two
-structure edits): 137 tests, 2 failing. The final run after those edits was started and interrupted by
-the user, so the state below is partly unverified:
+Full `pytest` on this laptop (Iris Xe, no CUDA) takes ≈ 6 min: 137 passed, 1 skipped, plus one `slow`
+test (real SAM 3.1 on the CPU, ≈ 1 min) that runs only with `--run-slow`. `gpu` tests are skipped
+without CUDA, `slow` tests without `--run-slow` (`tests/conftest.py`). The two failures listed in the
+earlier status were fixed by the last structure edits and are verified green.
 
-- Fixed and verified (targeted runs): `edge_width_px` (colour Canny on Lab gradients, median over
-  resolved profiles with ≥ 1.5-knot plateaus; the earlier p25 was dropped), `regularize` (arc rule
-  "circle rms ≤ tol, ≥ 8 knots, sagitta > tol, not a line within tol"; locked lines through the run's
-  centroid, vertices at line intersections — the fg and bg contour of one boundary now resolve to the
-  same line), `thin_line_frac` (thin residue of non-thin components after a 2×2 opening),
-  `noise_stats` (whole-map denominator), palette merging (drifting duplicates, transition-mix folding,
-  soft-boundary shading merge with `SHADE_DE` = 8, motif protection only across different colours and
-  only for components above the noise scale), edit loop `palette_deltaE_p95` (per-knot excess over the
-  photo, see `agents/loop.py` deviations), `test_edit.py::test_added_block…` (block colour changed to a
-  palette colour: a foreign colour quantises to the ground and reads as *missing*, not *added*).
+- `quantize` runs end to end from a photo with no `--corners`: SAM 3.1 mask → corners within ≈ 2 px
+  of the synthetic truth on the `geometric` fixture (IoU 0.98). Remaining gates on a good photo are
+  the missing-data ones from `setup-check` (`grid_unverified`, `qc_uncalibrated`).
+- SAM 3.1 on the CPU (`rectify.py`): the upstream `sam3` 0.1.0 package assumes CUDA in four places;
+  `_sam_cpu_shim` (constructor caches built with `device="cuda"`) and `_sam_cpu_patches`
+  (bf16 fused ViT MLP, `Tensor.pin_memory`) neutralise them in-process, nothing in site-packages
+  is edited. The model is built once per process (`_SAM_CACHE`); `load_from_HF=False` so a job
+  never touches the network. Loading prints `missing_keys=[...convs.3...]`: the 3.1 checkpoint has no
+  stride-32 neck conv; the image detector does not use it (masks are correct).
+- Internal geometry `border` source rewritten (see structure.py deviations): flat fixtures now
+  measure 0.1–0.8 knots (was 3–4, a false `non_planar_internal` on every bordered rug). The
+  synthetic `non_planar` bend (3 % of span, interior points only) stays below the 2.7-knot threshold
+  on the border edge; the tests assert measurability only, and true bend detection remains to be
+  validated on real photos.
 - Gradient mask: σ = 2 then σ = 4 passes, 16-knot blocks, edge-free zones, endpoint-ΔE rule and the
-  single-knot-dot dither test (`GRADIENT_MIN_DITHER`) — verified only on the diagnostic fixtures
-  (`geometric` seed 3 has no false corner regions, `gradient` seeds 62/71 keep their mask, the
-  two-colour `minimal` seed 141 has none). `test_flat_gradient_is_gradient_not_pictorial` passed in the
-  diagnostic, **not re-run under pytest**. The `class_mixed` and `gradient_mask_iou` tests were green in
-  the last complete run but predate the dot rule: re-run `tests/test_structure.py` first.
+  single-knot-dot dither test (`GRADIENT_MIN_DITHER`); `tests/test_structure.py` is green.
 - `test_class_detection_pure_templates`: 3 of 4 (the hv-symmetric `geometric` lattice is `classic` by
   rule order; tolerated by the test).
-- New stage params in `STAGE_PARAM_KEYS`: `gradient_min_dither` (structure), `noise_cc_max` (palette).
 - Spec-listed tests still missing: `tests/test_design.py`, `tests/test_prepare.py`, `tests/test_tools.py`;
   `eval/synth_modern_ids.txt` is not generated (`generate_designs.py --n 100 --ids-file`, ≈ 2 s/design).
-- Two test expectations were corrected to the spec's rule rather than the fixture number
-  (`test_calibrate.py`: null-share feature drop and the precision-based `qc_accept`; `test_edit.py`:
-  tiling only when the single pass is below `edit_px_per_knot_target`).
+- `train/train_edit_lora.py`: diffusers / peft are optional imports (`# type: ignore`), the PIL
+  return annotation goes through a `TYPE_CHECKING` import.
 
 Models and environment (`models/` is gitignored):
 
-- `.venv` now has CPU torch 2.14 + torchvision, `huggingface_hub` (`.venv/bin/hf`), and the `sam3`
+- `.venv` has CPU torch 2.14 + torchvision, `huggingface_hub` (`.venv/bin/hf`), and the `sam3`
   GitHub package installed with `--no-deps` (it pins `numpy<2`; the venv is numpy 2 / Python 3.14) plus
-  timm, ftfy, iopath, regex, einops, pycocotools, psutil, triton. It imports; inference is untested.
-- `models/sam3.1/`: not downloaded — `facebook/sam3.1` is gated. Accept the terms on Hugging Face, then
-  `.venv/bin/hf auth login` and `.venv/bin/hf download facebook/sam3.1 --local-dir models/sam3.1`
-  (3.5 GB, `sam3.1_multiplex.pt`). Until then every job needs `--corners`.
-- `models/qwen_image_edit_2511/`: a partial `hf download Qwen/Qwen-Image-Edit-2511` (≈ 17 of 57.7 GB)
-  stopped on request; `hf download` resumes it. `setup-check` reports the backend missing until
-  `model_index.json`, every shard and no `.incomplete` file are present. No GPU here anyway.
+  timm, ftfy, iopath, regex, einops, pycocotools, psutil, triton.
+- `models/sam3.1/`: downloaded (`sam3.1_multiplex.pt`, 3.5 GB); `setup-check` reports `sam ok`.
+- Qwen-Image-Edit weights were deleted (no GPU here; edit mode cannot run on this machine).
+  `setup-check` lists both `edit_backend:qwen_*` as missing; edit agents fall back to the quantize
+  baseline (`edit_fallback`). Re-download on a GPU box: `hf download Qwen/Qwen-Image-Edit-2511
+  --local-dir models/qwen_image_edit_2511` (57.7 GB).
 - `knotvision_segment.pt` (training), `qc_calib.json` (designer scores) and Muse (`allow_api` + key)
   are still missing; `cli.py setup-check` lists the gate each one triggers.

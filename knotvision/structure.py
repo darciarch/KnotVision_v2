@@ -24,6 +24,13 @@ Spec deviations (scale invariance; see CLAUDE.md "Scale: measure in knots"):
   (w+1) x (w+1) opening, per connected piece through metrics.is_thin): in the coarse label map a
   mixed-colour cell at a crossing glues two lines, or a line touches a motif of its colour, and
   the merged component would otherwise drop out of the share entirely.
+- internal geometry, `border` source: the inner border edge is traced as the L-gradient ridge that is
+  consistent along the whole side (gradient averaged along the edge over ~2 border thicknesses,
+  ridge row = global maximum, per-column gradient-weighted centroid within +-2 knots) and the
+  deviation is the p95 of the absolute residual instead of the maximum. A per-column argmax hits
+  motif edges inside the border and the +-1-knot steps of a serrated design edge, which read as
+  3-4 knots of "non-planarity" on a perfectly flat synthetic photo; a bend of the rug is a
+  low-frequency trace and survives the averaging.
 """
 from __future__ import annotations
 
@@ -676,10 +683,18 @@ def classify(f: dict, P: dict) -> dict:
 
 def border_inner_edge_dev(lab_full: np.ndarray, border: dict, scale: float) -> Optional[float]:
     """Refit the inner border edge per column (top/bottom) / row (left/right) at full resolution and
-    measure the max deviation from a straight line, in knots."""
+    measure the deviation from a straight line, in knots (p95 of the absolute residual).
+
+    The edge is the L-gradient ridge that is consistent along the whole side: the gradient is averaged
+    along the edge direction over ~2 border thicknesses (motif edges inside the border sit at varying
+    depths and wash out, a straight boundary or guard stripe does not), the ridge row is the global
+    maximum of that column-averaged profile, and each column then takes the gradient-weighted centroid
+    within +-2 knots of it. A bend of the rug moves the ridge over hundreds of px and survives the
+    averaging; the +-1-knot steps of a serrated design edge do not."""
     h, w = lab_full.shape[:2]
     devs = []
     L = lab_full[..., 0].astype(np.float32)
+    band = 2 * PX_PER_KNOT
     for e in ("top", "bottom", "left", "right"):
         t = border[e]["thickness_px"]
         if not t:
@@ -690,22 +705,30 @@ def border_inner_edge_dev(lab_full: np.ndarray, border: dict, scale: float) -> O
             continue
         if e == "top":
             g = np.abs(np.diff(L, axis=0))[rng, :]
-            pos = np.argmax(g, axis=0) + rng.start
         elif e == "bottom":
             g = np.abs(np.diff(L[::-1], axis=0))[rng, :]
-            pos = np.argmax(g, axis=0) + rng.start
         elif e == "left":
-            g = np.abs(np.diff(L, axis=1))[:, rng]
-            pos = np.argmax(g, axis=1) + rng.start
+            g = np.abs(np.diff(L, axis=1))[:, rng].T
         else:
-            g = np.abs(np.diff(L[:, ::-1], axis=1))[:, rng]
-            pos = np.argmax(g, axis=1) + rng.start
+            g = np.abs(np.diff(L[:, ::-1], axis=1))[:, rng].T
+        # g: (depth, along-edge). Average along the edge over ~2 thicknesses (odd width, >= 8 knots).
+        k = max(8 * PX_PER_KNOT, 2 * t_full) | 1
+        gs = cv2.blur(g, (k, 1), borderType=cv2.BORDER_REFLECT)
+        r0 = int(np.argmax(gs.mean(axis=1)))
+        lo, hi = max(0, r0 - band), min(gs.shape[0], r0 + band + 1)
+        # sub-pixel ridge position per column: gradient-weighted centroid inside the +-2-knot band. A
+        # serrated design edge (+-1 knot steps along the side) averages out inside the k-wide window; a
+        # bend of the rug is a low-frequency trace and remains.
+        win = gs[lo:hi, :]
+        rows = np.arange(lo, hi, dtype=np.float64)[:, None]
+        wsum = win.sum(axis=0) + 1e-6
+        pos = (win * rows).sum(axis=0) / wsum + rng.start
         x = np.arange(len(pos))
         step = max(1, len(pos) // 200)
         xs, ps = x[::step], pos[::step].astype(np.float64)
         a, b = np.polyfit(xs, ps, 1)
         resid = ps - (a * xs + b)
-        # robust: 95th percentile of abs residual to ignore motif hits
+        # robust: 95th percentile of abs residual to ignore residual motif hits
         devs.append(float(np.percentile(np.abs(resid), 95)) / PX_PER_KNOT)
     return max(devs) if devs else None
 
